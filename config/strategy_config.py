@@ -1,0 +1,44 @@
+STRATEGY_LIST = [
+    'ma_cross',
+    'macd_cross',
+    'kdj_oversold',
+    'boll_break',
+    'macd_kdj_resonance',
+    'multi_factor_score',
+]
+
+MA_SHORT = 5
+MA_MID = 10
+MA_LONG = 20
+MA_LONGER = 60
+
+MACD_FAST = 12
+MACD_SLOW = 26
+MACD_SIGNAL = 9
+
+KDJ_N = 9
+KDJ_M1 = 3
+KDJ_M2 = 3
+KDJ_OVERBOUGHT = 80
+KDJ_OVERSOLD = 20
+
+RSI_PERIOD = 14
+RSI_OVERBOUGHT = 70
+RSI_OVERSOLD = 30
+
+BOLL_PERIOD = 20
+BOLL_K = 2
+
+CCI_PERIOD = 14
+
+ATR_PERIOD = 14
+
+VOL_MA_PERIOD = 5
+
+BUY_THRESHOLD = 70
+SELL_THRESHOLD = 30
+
+SIGNAL_STRENGTH_BASE = 60
+
+RESONANCE_VOLUME_BOOST = True
+VOLUME_BOOST_RATIO = 1.2

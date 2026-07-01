@@ -1,0 +1,40 @@
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---------- 虚拟环境 ----------
+.venv/
+venv/
+env/
+ENV/
+
+# ---------- IDE / Editor ----------
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ---------- 本地配置 / 敏感信息 ----------
+.env
+.env.local
+
+# ---------- 日志 / 输出 / 数据 ----------
+logs/
+output/
+
+# ---------- 系统文件 ----------
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------- 其他临时文件 ----------
+*.log
+*.tmp
+*.bak
+_verify.py
