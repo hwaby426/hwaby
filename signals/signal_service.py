@@ -93,7 +93,7 @@ def generate_latest_daily_signal(
         - 传 --date（历史扫描）：
             * 最后一行 = 指定日期的历史K线
             * signal_time = 下一交易日（= 指定日期 + 1工作日，跳过周末）
-            * price = 最后一行 close（作为次日开盘价的近似）
+            * price = 下一交易日 open（由调用方在信号后重写，因为本函数只拿到指定日期之前的数据）
     """
     if df_daily.empty or len(df_daily) < 35:
         return []

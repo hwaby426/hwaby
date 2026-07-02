@@ -8,7 +8,10 @@ from data_fetcher.sina_fetcher import get_realtime_quotes
 from data_fetcher.stock_pool import get_stock_pool_from_db, get_stock_name_map
 from signals.signal_service import generate_latest_daily_signal, save_signals
 from signals.base import SignalRecord
-from scheduler.intraday_service import build_intraday_daily_df, build_historical_daily_df
+from scheduler.intraday_service import (
+    build_intraday_daily_df, build_historical_daily_df,
+    get_next_trading_day_open,
+)
 
 
 def _print_signal(sig, name_map, verbose=False):
@@ -16,7 +19,7 @@ def _print_signal(sig, name_map, verbose=False):
     name = name_map.get(sig.code, '')
     type_str = '买入' if sig.signal_type == 1 else '卖出'
     logger.info(
-        f"[信号] {sig.code} {name} {type_str} "
+        f"[信号] {sig.signal_time} {sig.code} {name} {type_str} "
         f"策略={sig.strategy} 价格={sig.price:.2f} "
         f"强度={sig.signal_strength} 原因={sig.reason}"
     )
@@ -312,7 +315,7 @@ def _scan_market_historical(
         try:
             signals = generate_latest_daily_signal(
                 df, normalized_code, strategy_names, check_volume=check_volume,
-                check_last_row=True,
+                check_last_row=True, historical_mode=True,
             )
         except Exception as e:
             if verbose:
@@ -320,6 +323,17 @@ def _scan_market_historical(
             else:
                 logger.debug(f"{code} 信号计算失败: {e}")
             continue
+
+        # —— 历史模式：信号日收盘确认，次日开盘买入 ——
+        if signals:
+            next_open = get_next_trading_day_open(normalized_code, scan_date)
+            if next_open is not None and next_open > 0:
+                for sig in signals:
+                    sig.price = next_open
+            else:
+                # 下一交易日无数据（如 scan_date 是数据库最新一天），保留原收盘价并提示
+                if verbose:
+                    logger.debug(f"  {normalized_code} 无法获取 {scan_date} 下一交易日开盘价，保留收盘价作为信号价")
 
         if verbose and not signals:
             from indicators.mytt_indicators import calc_all_indicators

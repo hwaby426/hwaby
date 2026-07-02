@@ -21,10 +21,11 @@ BS_FIELDS = (
     "turn,pctChg,isST"
 )
 
-_request_interval = 0.3
+_request_interval = 0.2
 _last_request_time = 0.0
-_min_interval = 0.2
-_max_interval = 2.0
+_min_interval = 0.1
+_max_interval = 0.5
+_base_interval = 0.2
 
 
 def _rate_limit():
@@ -37,14 +38,22 @@ def _rate_limit():
 
 
 def _slow_down():
+    """遭遇限流/服务端错误时减速（幅度温和，避免卡死）"""
     global _request_interval
-    _request_interval = min(_max_interval, _request_interval * 1.5)
+    _request_interval = min(_max_interval, _request_interval * 1.15)
     logger.debug(f"请求降速，间隔调整为 {_request_interval:.2f}s")
 
 
 def _speed_up():
+    """请求成功时快速回到基础间隔"""
     global _request_interval
-    _request_interval = max(_min_interval, _request_interval * 0.95)
+    _request_interval = max(_min_interval, _request_interval * 0.90)
+
+
+def _reset_interval():
+    """重登录后重置请求间隔"""
+    global _request_interval
+    _request_interval = _base_interval
 
 
 def normalize_code(code: str) -> str:
@@ -160,7 +169,8 @@ def fetch_daily_kline(
     )
     if rs.error_code != '0':
         err_msg = rs.error_msg or ''
-        if "网络接收错误" in err_msg or "10054" in err_msg or "连接被重置" in err_msg:
+        # 需要触发重连的错误：网络断开 / session 失效
+        if any(k in err_msg for k in ["网络接收错误", "10054", "连接被重置", "用户未登录", "you don't login", "login"]):
             raise ConnectionError(f"{code} 获取K线失败: {err_msg}")
         logger.error(f"{code} 获取K线失败: {err_msg}")
         return pd.DataFrame()
@@ -193,6 +203,34 @@ def get_last_kline_date(code: str) -> Optional[str]:
         if last:
             return last.trade_date.strftime('%Y-%m-%d')
     return None
+
+
+def get_last_kline_dates_batch(codes: List[str]) -> Dict[str, str]:
+    """一次性查询所有股票的最后K线日期（代替 N 次单表查询）
+
+    Args:
+        codes: 股票代码列表，支持带点("sz.002624")或不带点("sz002624")格式
+
+    Returns:
+        {code_in_dot_format: last_date_str} — 仅包含有数据的股票
+    """
+    if not codes:
+        return {}
+
+    # 统一规范化为带点格式
+    norm_codes = [normalize_code(c) for c in codes]
+
+    with session_scope() as session:
+        from sqlalchemy import func, text
+        results = session.query(
+            DailyKline.code,
+            func.max(DailyKline.trade_date).label('last_date')
+        ).filter(
+            DailyKline.code.in_(norm_codes),
+            DailyKline.adjustflag == int(ADJUST_FLAG),
+        ).group_by(DailyKline.code).all()
+
+        return {r.code: r.last_date.strftime('%Y-%m-%d') for r in results if r.last_date}
 
 
 def save_daily_klines(code: str, df: pd.DataFrame):
@@ -233,6 +271,47 @@ def save_daily_klines(code: str, df: pd.DataFrame):
                 turnover = VALUES(turnover)
         """)
         session.execute(sql, rows)
+
+
+def save_daily_klines_batch(rows: List[dict], batch_size: int = 3000) -> int:
+    """批量插入多只股票的K线数据
+
+    Args:
+        rows: 字典列表，每 dict 包含 code, trade_date, open, high, low, close, volume, amount, pct_chg, turnover, adjustflag
+        batch_size: 每批插入的行数，避免 SQL 过长
+
+    Returns:
+        实际插入的总行数
+    """
+    if not rows:
+        return 0
+
+    from sqlalchemy import text
+
+    total = 0
+    for start_i in range(0, len(rows), batch_size):
+        batch = rows[start_i:start_i + batch_size]
+        with session_scope() as session:
+            sql = text("""
+                INSERT INTO daily_kline
+                    (code, trade_date, open, high, low, close, volume, amount, pct_chg, turnover, adjustflag, created_at)
+                VALUES
+                    (:code, :trade_date, :open, :high, :low, :close, :volume, :amount, :pct_chg, :turnover, :adjustflag, NOW())
+                ON DUPLICATE KEY UPDATE
+                    open = VALUES(open),
+                    high = VALUES(high),
+                    low = VALUES(low),
+                    close = VALUES(close),
+                    volume = VALUES(volume),
+                    amount = VALUES(amount),
+                    pct_chg = VALUES(pct_chg),
+                    turnover = VALUES(turnover)
+            """)
+            session.execute(sql, batch)
+        total += len(batch)
+        logger.info(f"[批量存储] 已写入 {total}/{len(rows)} 条")
+
+    return total
 
 
 def update_single_stock(code: str, end_date: str = None) -> int:
@@ -276,26 +355,166 @@ def update_single_stock(code: str, end_date: str = None) -> int:
 def update_all_daily_klines(
     stock_pool: Optional[List[str]] = None,
 ):
-    """顺序更新所有股票的日线数据，支持CTRL+C中断"""
+    """批量更新全市场日线数据
+
+    优化点：
+    1. 一次性查询所有股票的最后日期（1 条 SQL）
+    2. 仅对需要更新的股票调用 API
+    3. 收集所有新 K 线到内存，最后批量插入数据库
+
+    支持 CTRL+C 中断，已获取的数据仍会被写入
+    """
     if not bs_login():
         return
     try:
         if not stock_pool:
             stock_pool = settings.get_stock_pool()
-        codes = stock_pool
-        logger.info(f"开始更新 {len(codes)} 只股票的日线数据")
-        total = 0
-        for code in tqdm(codes, desc="更新日线"):
-            try:
-                cnt = update_single_stock(code)
-                total += cnt
-            except Exception as e:
-                logger.error(f"{code} 异常: {e}")
-        logger.info(f"日线更新完成，共新增/更新 {total} 条K线")
-        return total
+        total_codes = len(stock_pool)
+        logger.info(f"开始更新 {total_codes} 只股票的日线数据")
+
+        end_date = datetime.now().strftime('%Y-%m-%d')
+        default_start = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
+
+        # ── 1. 一次性查询所有股票的最后K线日期 ─────
+        last_dates = get_last_kline_dates_batch(stock_pool)
+        logger.info(f"[步骤1] 已查询 {len(last_dates)} 只股票的本地最后日期")
+
+        # ── 2. 筛选需要更新的股票 ──────────────
+        to_update = []  # [(norm_code, start_date, end_date), ...]
+        already_latest = 0
+        for code in stock_pool:
+            norm_code = normalize_code(code)
+            last_date = last_dates.get(norm_code)
+            if last_date:
+                start_date = (
+                    datetime.strptime(last_date, '%Y-%m-%d') + timedelta(days=1)
+                ).strftime('%Y-%m-%d')
+                if start_date > end_date:
+                    already_latest += 1
+                    continue
+                to_update.append((norm_code, start_date, end_date))
+            else:
+                # 数据库中没有这只股票的数据，获取最近一年
+                to_update.append((norm_code, default_start, end_date))
+
+        logger.info(
+            f"[步骤2] 需要更新: {len(to_update)} 只, 已是最新: {already_latest} 只"
+        )
+
+        # ── 3. 批量获取K线数据并收集到内存 ──────
+        all_rows = []  # 所有股票的新 K 线
+        total_klines = 0
+        failed = 0
+        login_count = 1  # 已登录次数（用于周期性重登录）
+        RELogIN_INTERVAL = 100  # 每处理 N 只股票自动重登录一次（session约100次请求后失效）
+        start_time = datetime.now()
+
+        for i, (norm_code, start_date, code_end) in enumerate(to_update, 1):
+            retry_success = False
+            # 每只股票最多重试 2 次（每次失败都先重登录）
+            for attempt in range(2):
+                try:
+                    df = fetch_daily_kline(norm_code, start_date, code_end)
+                    if not df.empty:
+                        adjust_flag = int(ADJUST_FLAG)
+                        for _, row in df.iterrows():
+                            all_rows.append({
+                                'code': norm_code,
+                                'trade_date': row['date'],
+                                'open': float(row['open']),
+                                'high': float(row['high']),
+                                'low': float(row['low']),
+                                'close': float(row['close']),
+                                'volume': int(row['volume']),
+                                'amount': float(row['amount']),
+                                'pct_chg': float(row['pctChg']) if pd.notna(row['pctChg']) else None,
+                                'turnover': float(row['turn']) if pd.notna(row['turn']) else None,
+                                'adjustflag': adjust_flag,
+                            })
+                        total_klines += len(df)
+                    _speed_up()  # 成功则逐步降低延迟
+                    retry_success = True
+                    break
+
+                except Exception as e:
+                    err_msg = str(e)
+                    # 识别 session 相关错误，触发重登录（session 失效≠被限流，不减速）
+                    if any(k in err_msg for k in [
+                        "10054", "连接被重置", "远程主机强迫关闭",
+                        "网络接收错误", "用户未登录", "you don't login", "login",
+                    ]):
+                        logger.warning(f"{norm_code} session失效({err_msg})，重新登录 BaoStock...")
+                        try:
+                            bs_logout()
+                        except Exception:
+                            pass
+                        time.sleep(1)  # 缩短等待，尽快恢复
+                        if bs_login():
+                            login_count += 1
+                            _reset_interval()  # 重登录成功后重置请求间隔
+                            continue  # 重登录成功，重试当前股票
+                        time.sleep(3)
+                    else:
+                        # 非 session 错误（如数据格式问题），才考虑减速
+                        _slow_down()
+                    # 非 session 问题，或重登录失败，记录后放弃
+                    failed += 1
+                    if failed <= 5:
+                        logger.error(f"{norm_code} 失败(尝试{attempt+1}次): {e}")
+                    break
+
+            if not retry_success and failed <= 5:
+                logger.error(f"{norm_code} 最终失败，跳过")
+
+            # 进度日志
+            if i % 200 == 0:
+                elapsed = (datetime.now() - start_time).total_seconds()
+                speed = i / elapsed if elapsed > 0 else 0
+                remaining = (len(to_update) - i) / speed if speed > 0 else 0
+                logger.info(
+                    f"[进度] {i:>5}/{len(to_update)} "
+                    f"已获取K线:{total_klines:>6} "
+                    f"速度:{speed:.1f}只/秒 "
+                    f"预计剩余:{remaining/60:.0f}分钟"
+                )
+
+            # 每 N 只股票自动重登录一次，防止 session 过期
+            if i % RELogIN_INTERVAL == 0:
+                logger.info(f"[连接维护] 已处理 {i} 只，自动重登录 BaoStock...")
+                try:
+                    bs_logout()
+                except Exception:
+                    pass
+                time.sleep(1)  # 缩短等待
+                if bs_login():
+                    login_count += 1
+                    _reset_interval()  # 重置请求间隔
+                else:
+                    logger.warning("重登录失败，继续尝试...")
+                    time.sleep(3)
+                    bs_login()
+                    login_count += 1
+                    _reset_interval()
+
+        logger.info(f"[步骤3] 数据获取完成，共 {total_klines} 条新K线，失败 {failed} 只, 重登录 {login_count-1} 次")
+
+        # ── 4. 批量写入数据库 ──────────────────
+        if all_rows:
+            logger.info(f"[步骤4] 开始批量写入 {len(all_rows)} 条K线数据...")
+            saved = save_daily_klines_batch(all_rows, batch_size=3000)
+            logger.info(f"[步骤4] 批量写入完成: {saved} 条K线")
+        else:
+            logger.info("[步骤4] 没有新数据需要写入")
+
+        logger.info(f"日线更新完成，共新增/更新 {total_klines} 条K线")
+        return total_klines
+
     except KeyboardInterrupt:
-        logger.info("收到中断信号，停止更新...")
-        return total if 'total' in dir() else 0
+        logger.info("收到中断信号，写入已获取的数据后停止...")
+        if 'all_rows' in dir() and all_rows:
+            logger.info(f"写入已获取的 {len(all_rows)} 条K线...")
+            save_daily_klines_batch(all_rows, batch_size=3000)
+        return total_klines if 'total_klines' in dir() else 0
     finally:
         bs_logout()
 

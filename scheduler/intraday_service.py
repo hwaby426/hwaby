@@ -70,3 +70,28 @@ def build_historical_daily_df(code: str, target_date: str, history_days: int = 1
         return pd.DataFrame()
 
     return df_hist
+
+
+def get_next_trading_day_open(code: str, target_date: str) -> float:
+    """获取 target_date 之后第一个交易日的开盘价（用于历史扫描：信号日收盘确认，次日开盘买入）
+
+    Returns:
+        下一交易日的开盘价。如果找不到（如 target_date 是数据库最后一天），返回 None
+    """
+    # 取 target_date 之后最多 10 天的数据，找到第一个有数据的交易日
+    from datetime import datetime, timedelta
+    try:
+        base = datetime.strptime(target_date, '%Y-%m-%d')
+    except (ValueError, TypeError):
+        return None
+
+    # 用 end_date 后推 10 天，覆盖可能的长周末/节假日
+    end_date = (base + timedelta(days=10)).strftime('%Y-%m-%d')
+    start_date = (base + timedelta(days=1)).strftime('%Y-%m-%d')
+
+    df = get_daily_kline_df(code, start_date=start_date, end_date=end_date)
+    if df.empty:
+        return None
+
+    # 取第一行的 open 价格（即 target_date 之后的第一个交易日）
+    return float(df['open'].iloc[0])
