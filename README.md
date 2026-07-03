@@ -11,6 +11,9 @@ python main.py update-market
 python main.py scan-market  --strategies MACD金叉  --date 2026-06-29  --codes sz.300454 
 
 
+// 预测 MACD 金叉信号
+python main.py scan-market  --strategies MACD预测金叉  --date 2026-07-02
+
 ## 单股票多策略对比
 python main.py compare \
   --code sz.300454 \
