@@ -657,28 +657,24 @@ def macd_intraday_pnl_from_db(start, end, codes):
 
 
 @cli.command('macd-predict')
-@click.option('--date', 'signal_date', default=None, help='信号日 YYYY-MM-DD。不传=今天盘中扫描（实时行情）')
+@click.option('--date', 'signal_date', required=True, help='信号日 YYYY-MM-DD，用当日收盘价判断是否触发预测金叉')
 @click.option('--codes', default=None, help='指定股票代码，逗号分隔。不传=全市场扫描')
 @click.option('--no-volume', is_flag=True, default=False, help='关闭成交量过滤（默认开启）')
-@click.option('--forward-days', default=1, type=int, help='向后验证多少个交易日，默认5天。--no-verify 时无效')
+@click.option('--forward-days', default=1, type=int, help='向后验证多少个交易日。--no-verify 时无效')
 @click.option('--no-verify', is_flag=True, default=False, help='只检测信号，不做后续金叉验证')
 def macd_predict_cmd(signal_date, codes, no_volume, forward_days, no_verify):
-    """【MACD预测金叉 · 专用命令】扫描 → 逐行打印信号 → 验证命中率。
+    """【MACD预测金叉 · 专用命令】批量拉K线 → 逐行打印信号 → 验证后续金叉命中率。
 
     典型用法:
       python main.py macd-predict --date 2026-07-02              # 全市场 + 自动验证
       python main.py macd-predict --date 2026-07-02 --no-verify  # 只扫描不验证
       python main.py macd-predict --date 2026-07-02 --codes sh.600006,sh.600048  # 指定股票
-      python main.py macd-predict                                 # 盘中实时扫描
     """
-    from data_fetcher.baostock_fetcher import normalize_code, get_daily_kline_df
+    from data_fetcher.baostock_fetcher import normalize_code, get_daily_kline_batch
     from data_fetcher.stock_pool import get_stock_pool_from_db, get_stock_name_map
-    from data_fetcher.sina_fetcher import get_realtime_quotes
-    from scheduler.intraday_service import build_intraday_daily_df, build_historical_daily_df
     from indicators.mytt_indicators import calc_all_indicators
     from signals.manager import get_strategy
     from datetime import datetime, timedelta
-    import time as _time
 
     # --- 确定扫描范围 ---
     if codes:
@@ -693,54 +689,39 @@ def macd_predict_cmd(signal_date, codes, no_volume, forward_days, no_verify):
     name_map = get_stock_name_map()
     strategy = get_strategy('MACD预测金叉', check_volume=not no_volume)
 
+    try:
+        base_dt = datetime.strptime(signal_date, '%Y-%m-%d')
+    except ValueError:
+        logger.error("日期格式错误，请使用 YYYY-MM-DD")
+        return
+
     # --- 打印表头 ---
     logger.info("=" * 95)
-    if signal_date:
-        logger.info(f"  【MACD 预测金叉】历史扫描 — 信号日: {signal_date}  股票: {len(pool)} 只")
-    else:
-        logger.info(f"  【MACD 预测金叉】盘中扫描 — {datetime.now().strftime('%Y-%m-%d')}  股票: {len(pool)} 只")
+    logger.info(f"  【MACD 预测金叉】历史扫描 — 信号日: {signal_date}  股票: {len(pool)} 只")
     logger.info(f"  策略条件: 绿柱 + 连续2日增大 + 3日缩柱>=30% + DIF拐头向上 + 量>20日均量 + 需涨<5%即可金叉")
     logger.info(f"  成交量过滤: {'关闭' if no_volume else '开启'}   验证: {'关闭' if no_verify else str(forward_days) + '日'}")
     logger.info("=" * 95)
 
-    # --- Phase 1: 逐只扫描（与 scan_market 相同的 [信号] 格式逐行打印）---
+    # --- Phase 1: 批量拉K线 → 逐只扫描（与 scan_market 相同的 [信号] 格式逐行打印）---
     all_signals = []
-    total_scanned = 0
     start_time = datetime.now()
 
-    intraday_mode = signal_date is None
-    if intraday_mode:
-        logger.info(f"  正在获取 {len(pool)} 只股票的实时行情...")
-        realtime_map = {}
-        batch_size = 200
-        for bi in range(0, len(pool), batch_size):
-            batch = pool[bi:bi + batch_size]
-            try:
-                qdf = get_realtime_quotes(batch)
-                if qdf is not None and not qdf.empty:
-                    for _, row in qdf.iterrows():
-                        rc = str(row.get('code', ''))
-                        price = float(row.get('price', 0))
-                        if rc and price > 0:
-                            realtime_map[rc] = price
-            except Exception as e:
-                logger.warning(f"  第{bi//batch_size+1}批实时行情获取失败: {e}")
-                continue
-            _time.sleep(0.2)
-        logger.info(f"  实时行情: 成功 {len(realtime_map)} 只")
+    # 单次查询所有股票 [signal_date - 200天, signal_date] 的K线
+    hist_start = (base_dt - timedelta(days=300)).strftime('%Y-%m-%d')
+    logger.info(f"  [数据] 批量查询历史K线: {hist_start} ~ {signal_date} ...")
+    kline_map = get_daily_kline_batch(pool, start_date=hist_start, end_date=signal_date)
+    fetched = len(kline_map)
+    logger.info(f"  [数据] 批量查询完成，有K线数据的股票 {fetched}/{len(pool)} 只")
 
     for code in pool:
-        total_scanned += 1
         try:
-            if intraday_mode:
-                price = realtime_map.get(code, 0)
-                if price <= 0:
-                    continue
-                df = build_intraday_daily_df(code, {'code': code, 'price': price})
-            else:
-                df = build_historical_daily_df(code, signal_date)
+            df = kline_map.get(code)
+            if df is None or df.empty or len(df) < 35:
+                continue
 
-            if df.empty or len(df) < 35:
+            # 最后一行的日期必须等于 signal_date（信号日必须有交易）
+            last_date = str(df['date'].iloc[-1])
+            if last_date != signal_date:
                 continue
 
             df_ind = calc_all_indicators(df)
@@ -786,7 +767,7 @@ def macd_predict_cmd(signal_date, codes, no_volume, forward_days, no_verify):
         logger.info(f"  未发现任何 MACD 预测金叉信号（扫描耗时 {elapsed:.0f}s）")
         return
 
-    # --- Phase 2: 验证（如需要）---
+    # --- Phase 2: 验证（如需要）—— 同样批量查询信号股的后续K线 ---
     if no_verify:
         logger.info("  （--no-verify 已设置，跳过后续金叉验证）")
         return
@@ -796,16 +777,12 @@ def macd_predict_cmd(signal_date, codes, no_volume, forward_days, no_verify):
     logger.info(f"  【验证报告】检查后续 {forward_days} 个交易日中是否真的形成金叉")
     logger.info("=" * 95)
 
-    try:
-        base_dt = datetime.strptime(
-            signal_date or datetime.now().strftime('%Y-%m-%d'), '%Y-%m-%d'
-        )
-    except ValueError:
-        logger.error("日期格式错误")
-        return
-
-    start_lookup = (base_dt - timedelta(days=60)).strftime('%Y-%m-%d')
-    end_lookup = (base_dt + timedelta(days=forward_days + 10)).strftime('%Y-%m-%d')
+    # 批量查询所有信号股的 [signal_date - 60天, signal_date + forward_days + 10天] K线
+    v_start = (base_dt - timedelta(days=60)).strftime('%Y-%m-%d')
+    v_end = (base_dt + timedelta(days=forward_days + 10)).strftime('%Y-%m-%d')
+    signal_codes = [s['code'] for s in all_signals]
+    v_kline_map = get_daily_kline_batch(signal_codes, start_date=v_start, end_date=v_end)
+    logger.info(f"  [数据] 验证阶段K线: {v_start} ~ {v_end}, 已获取 {len(v_kline_map)}/{len(signal_codes)} 只")
 
     cross_1d = cross_3d = cross_5d = 0
     bar_ok_1d = 0
@@ -815,8 +792,8 @@ def macd_predict_cmd(signal_date, codes, no_volume, forward_days, no_verify):
 
     for sig in all_signals:
         code = sig['code']
-        df_fwd = get_daily_kline_df(code, start_date=start_lookup, end_date=end_lookup)
-        if df_fwd.empty or len(df_fwd) < 35:
+        df_fwd = v_kline_map.get(code)
+        if df_fwd is None or df_fwd.empty or len(df_fwd) < 35:
             unverifiable += 1
             detail_rows.append({**sig, 'note': '无后续K线数据'})
             continue
@@ -827,7 +804,7 @@ def macd_predict_cmd(signal_date, codes, no_volume, forward_days, no_verify):
             detail_rows.append({**sig, 'note': '无后续K线数据'})
             continue
 
-        # 定位信号日在后续扩展K线中的索引
+        # 定位信号日在扩展K线中的索引
         sig_day = sig['signal_time']
         sig_idx = None
         for i in range(len(df_ind)):
