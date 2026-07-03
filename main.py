@@ -656,161 +656,265 @@ def macd_intraday_pnl_from_db(start, end, codes):
     logger.info("=" * 70)
 
 
-@cli.command('verify-macd')
-@click.option('--date', 'signal_date', required=True, help='信号日 YYYY-MM-DD（预测金叉的当天）')
-@click.option('--codes', default=None, help='指定股票代码，逗号分隔。不传=全市场扫描')
-@click.option('--no-volume', is_flag=True, default=False, help='关闭成交量过滤')
-@click.option('--forward-days', default=5, type=int, help='向后验证多少个交易日，默认5天')
-def verify_macd_cmd(signal_date, codes, no_volume, forward_days):
-    """验证 MACD预测金叉 信号：信号日后是否真的形成金叉 / MACD柱继续增大"""
-    from signals.signal_service import verify_macd_predictions
-
-    code_list = [c.strip() for c in codes.split(',') if c.strip()] if codes else None
-
-    result = verify_macd_predictions(
-        signal_date=signal_date,
-        codes=code_list,
-        check_volume=not no_volume,
-        forward_days=forward_days,
-    )
-
-    _print_macd_verify_report(result)
-
-
-def _print_macd_verify_report(result: dict):
-    """打印 MACD 预测验证报告（复用: verify-macd 和 macd-predict 共享）"""
-    total = result.get('total_signals', 0)
-    if total == 0:
-        logger.info(f"  ✗ 当日无任何 MACD 预测金叉信号")
-        return
-
-    logger.info("")
-    logger.info("=" * 90)
-    logger.info(f"  【验证报告】 信号日: {result['signal_date']}")
-    logger.info("=" * 90)
-    logger.info(f"  触发信号: {total} 只    可验证: {result.get('verified', 0)} 只")
-    logger.info("-" * 90)
-    logger.info(f"  ▶ 金叉验证:")
-    logger.info(f"     次日金叉: {result.get('cross_within_1d', 0)} 只   命中率: {result.get('hit_rate_1d_pct', '-')}%")
-    logger.info(f"     3日内金叉: {result.get('cross_within_3d', 0)} 只   命中率: {result.get('hit_rate_3d_pct', '-')}%")
-    logger.info(f"     5日内金叉: {result.get('cross_within_5d', 0)} 只   命中率: {result.get('hit_rate_5d_pct', '-')}%")
-    logger.info(f"  ▶ MACD柱次日继续增大: {result.get('bar_keep_growing_1d', 0)} 只   命中率: {result.get('bar_hit_rate_1d_pct', '-')}%")
-    logger.info(f"  ▶ 股价表现: 次日均价={result.get('avg_pct_1d', '-')}%   3日均价={result.get('avg_pct_3d', '-')}%   5日均价={result.get('avg_pct_5d', '-')}%")
-    logger.info("=" * 90)
-
-    detail = result.get('detail', [])
-    if not detail:
-        return
-
-    logger.info(f"  {'序号':>3} {'代码':<12} {'名称':<10} {'信号价':>8} {'DIF':>9} {'DEA':>9} {'几日金叉':>8} {'次日柱增大':>10} {'1日%':>7} {'3日%':>7} {'5日%':>7}  原因/备注")
-    logger.info("-" * 145)
-    for i, d in enumerate(detail, 1):
-        cross_flag = str(d['days_to_cross']) if d['days_to_cross'] is not None else '未金叉'
-        bar_flag = '✓' if d.get('bar_continued_1d') is True else ('✗' if d.get('bar_continued_1d') is False else '-')
-        pct1 = f"{d['pct_1d']:.2f}" if d.get('pct_1d') is not None else '-'
-        pct3 = f"{d['pct_3d']:.2f}" if d.get('pct_3d') is not None else '-'
-        pct5 = f"{d['pct_5d']:.2f}" if d.get('pct_5d') is not None else '-'
-        note = d.get('note', '')
-        reason = d.get('reason', '')[:60]
-        extra = note if note else reason
-        logger.info(f"  {i:>3} {d['code']:<12} {d.get('name',''):<10} {d['close_on_signal']:>8.2f} "
-                    f"{d['dif_on_signal']:>9.4f} {d['dea_on_signal']:>9.4f} "
-                    f"{cross_flag:>8} {bar_flag:>10} {pct1:>7} {pct3:>7} {pct5:>7}  {extra}")
-
-    logger.info("=" * 145)
-
-
 @cli.command('macd-predict')
-@click.option('--date', 'signal_date', default=None, help='信号日 YYYY-MM-DD。不传=今天盘中扫描')
+@click.option('--date', 'signal_date', default=None, help='信号日 YYYY-MM-DD。不传=今天盘中扫描（实时行情）')
 @click.option('--codes', default=None, help='指定股票代码，逗号分隔。不传=全市场扫描')
-@click.option('--no-volume', is_flag=True, default=False, help='关闭成交量过滤')
-@click.option('--forward-days', default=5, type=int, help='向后验证多少个交易日，默认5天')
-@click.option('--no-verify', is_flag=True, default=False, help='只检测信号不做验证')
+@click.option('--no-volume', is_flag=True, default=False, help='关闭成交量过滤（默认开启）')
+@click.option('--forward-days', default=1, type=int, help='向后验证多少个交易日，默认5天。--no-verify 时无效')
+@click.option('--no-verify', is_flag=True, default=False, help='只检测信号，不做后续金叉验证')
 def macd_predict_cmd(signal_date, codes, no_volume, forward_days, no_verify):
-    """【MACD预测金叉专用】检测信号并自动验证。一命令搞定扫描+验证。
+    """【MACD预测金叉 · 专用命令】扫描 → 逐行打印信号 → 验证命中率。
 
     典型用法:
-      python main.py macd-predict --date 2026-07-02        # 全市场扫描 + 自动验证
-      python main.py macd-predict --date 2026-07-02 --no-verify  # 只检测不验证
+      python main.py macd-predict --date 2026-07-02              # 全市场 + 自动验证
+      python main.py macd-predict --date 2026-07-02 --no-verify  # 只扫描不验证
       python main.py macd-predict --date 2026-07-02 --codes sh.600006,sh.600048  # 指定股票
-      python main.py macd-predict                            # 盘中扫描（需实时行情）
+      python main.py macd-predict                                 # 盘中实时扫描
     """
-    from signals.signal_service import verify_macd_predictions
-    from data_fetcher.stock_pool import get_stock_name_map, get_stock_pool_from_db
-    from data_fetcher.baostock_fetcher import normalize_code
+    from data_fetcher.baostock_fetcher import normalize_code, get_daily_kline_df
+    from data_fetcher.stock_pool import get_stock_pool_from_db, get_stock_name_map
+    from data_fetcher.sina_fetcher import get_realtime_quotes
+    from scheduler.intraday_service import build_intraday_daily_df, build_historical_daily_df
+    from indicators.mytt_indicators import calc_all_indicators
+    from signals.manager import get_strategy
+    from datetime import datetime, timedelta
+    import time as _time
 
-    # ---- Step 1: 检测信号 ----
-    logger.info("=" * 90)
-    if signal_date:
-        logger.info(f"  【MACD 预测金叉】历史扫描 — 信号日: {signal_date}")
+    # --- 确定扫描范围 ---
+    if codes:
+        pool = [normalize_code(c.strip()) for c in codes.split(',') if c.strip()]
     else:
-        logger.info(f"  【MACD 预测金叉】盘中扫描 — 实时行情")
-    logger.info("=" * 90)
-
-    code_list = [c.strip() for c in codes.split(',') if c.strip()] if codes else None
-
-    # 走 verify_macd_predictions 的信号检测逻辑
-    result = verify_macd_predictions(
-        signal_date=signal_date or 'today',
-        codes=code_list,
-        check_volume=not no_volume,
-        forward_days=forward_days if not no_verify else 0,
-    )
-
-    # 修正: 如果 signal_date 为 'today' 且没数据，fallback
-    if not result or result.get('total_signals', 0) == 0 and not signal_date:
-        # 盘中模式走 scan-market 逻辑
-        from scheduler.market_scan import scan_market_intraday
-        scan_market_intraday(
-            strategy_names=['MACD预测金叉'],
-            signal_type='buy',
-            codes=code_list,
-            check_volume=not no_volume,
-            save=False,
-        )
+        raw = get_stock_pool_from_db()
+        pool = [normalize_code(c) for c in raw]
+    if not pool:
+        logger.error("股票池为空，先运行 update-stock-list")
         return
 
-    # ---- Step 2: 打印信号列表 ----
-    detail = result.get('detail', [])
-    total = result.get('total_signals', 0)
+    name_map = get_stock_name_map()
+    strategy = get_strategy('MACD预测金叉', check_volume=not no_volume)
+
+    # --- 打印表头 ---
+    logger.info("=" * 95)
+    if signal_date:
+        logger.info(f"  【MACD 预测金叉】历史扫描 — 信号日: {signal_date}  股票: {len(pool)} 只")
+    else:
+        logger.info(f"  【MACD 预测金叉】盘中扫描 — {datetime.now().strftime('%Y-%m-%d')}  股票: {len(pool)} 只")
+    logger.info(f"  策略条件: 绿柱 + 连续2日增大 + 3日缩柱>=30% + DIF拐头向上 + 量>20日均量 + 需涨<5%即可金叉")
+    logger.info(f"  成交量过滤: {'关闭' if no_volume else '开启'}   验证: {'关闭' if no_verify else str(forward_days) + '日'}")
+    logger.info("=" * 95)
+
+    # --- Phase 1: 逐只扫描（与 scan_market 相同的 [信号] 格式逐行打印）---
+    all_signals = []
+    total_scanned = 0
+    start_time = datetime.now()
+
+    intraday_mode = signal_date is None
+    if intraday_mode:
+        logger.info(f"  正在获取 {len(pool)} 只股票的实时行情...")
+        realtime_map = {}
+        batch_size = 200
+        for bi in range(0, len(pool), batch_size):
+            batch = pool[bi:bi + batch_size]
+            try:
+                qdf = get_realtime_quotes(batch)
+                if qdf is not None and not qdf.empty:
+                    for _, row in qdf.iterrows():
+                        rc = str(row.get('code', ''))
+                        price = float(row.get('price', 0))
+                        if rc and price > 0:
+                            realtime_map[rc] = price
+            except Exception as e:
+                logger.warning(f"  第{bi//batch_size+1}批实时行情获取失败: {e}")
+                continue
+            _time.sleep(0.2)
+        logger.info(f"  实时行情: 成功 {len(realtime_map)} 只")
+
+    for code in pool:
+        total_scanned += 1
+        try:
+            if intraday_mode:
+                price = realtime_map.get(code, 0)
+                if price <= 0:
+                    continue
+                df = build_intraday_daily_df(code, {'code': code, 'price': price})
+            else:
+                df = build_historical_daily_df(code, signal_date)
+
+            if df.empty or len(df) < 35:
+                continue
+
+            df_ind = calc_all_indicators(df)
+            if df_ind.empty:
+                continue
+
+            last_idx = len(df_ind) - 1
+            last = df_ind.iloc[last_idx]
+            sig_series = strategy.generate_signals(df_ind)
+            if int(sig_series.iloc[last_idx]) != 1:
+                continue
+
+            reason_val = str(strategy.calc_reason(df_ind, sig_series).iloc[last_idx] or '')
+            strength_val = float(strategy.calc_strength(df_ind, sig_series).iloc[last_idx] or 0)
+            price_val = float(last.get('close', 0))
+            sig_time = str(df_ind['date'].iloc[last_idx])
+            name = name_map.get(code, '')
+
+            # 打印：跟 scan_market 完全一致的格式
+            logger.info(
+                f"[信号] {sig_time} {code} {name} 买入 "
+                f"策略=MACD预测金叉 价格={price_val:.2f} "
+                f"强度={strength_val:.0f} 原因={reason_val}"
+            )
+
+            all_signals.append({
+                'code': code, 'name': name, 'signal_time': sig_time,
+                'price': price_val, 'close_on_signal': price_val,
+                'dif_on_signal': float(last.get('dif', 0)),
+                'dea_on_signal': float(last.get('dea', 0)),
+                'macd_on_signal': float(last.get('macd', 0)),
+                'reason': reason_val, 'strength': strength_val,
+            })
+        except Exception:
+            continue
+
+    # --- Phase 1 汇总 ---
+    elapsed = (datetime.now() - start_time).total_seconds()
+    logger.info("-" * 95)
+    if all_signals:
+        logger.info(f"  共 {len(all_signals)} 只股票触发 MACD 预测金叉信号（扫描耗时 {elapsed:.0f}s）")
+    else:
+        logger.info(f"  未发现任何 MACD 预测金叉信号（扫描耗时 {elapsed:.0f}s）")
+        return
+
+    # --- Phase 2: 验证（如需要）---
+    if no_verify:
+        logger.info("  （--no-verify 已设置，跳过后续金叉验证）")
+        return
 
     logger.info("")
-    logger.info(f"  ✔ 检测到 {total} 只股票触发 MACD 预测金叉信号")
-    logger.info("-" * 90)
+    logger.info("=" * 95)
+    logger.info(f"  【验证报告】检查后续 {forward_days} 个交易日中是否真的形成金叉")
+    logger.info("=" * 95)
 
-    if total > 0:
-        # 按强度排序
-        detail_sorted = sorted(detail, key=lambda x: x.get('strength', 0), reverse=True)
-        logger.info(f"  {'序号':>3} {'代码':<12} {'名称':<10} {'价格':>8} {'强度':>8} {'需涨%':>8} {'缩柱%':>8} {'DIF':>10}")
-        logger.info("-" * 100)
-        for i, d in enumerate(detail_sorted, 1):
-            reason = d.get('reason', '')
-            # 从 reason 文本中解析 需涨% 和 缩柱%
-            needed_pct = '-'
-            shrink_pct = '-'
-            import re
-            m = re.search(r'需涨([\d\.]+)%', reason)
-            if m:
-                needed_pct = m.group(1) + '%'
-            m2 = re.search(r'缩短([\d\.]+)%', reason)
-            if m2:
-                shrink_pct = m2.group(1) + '%'
-            name = d.get('name', '')
-            logger.info(f"  {i:>3} {d['code']:<12} {name:<10} {d['close_on_signal']:>8.2f} "
-                        f"{d.get('strength', 0):>8.0f} {needed_pct:>8} {shrink_pct:>8} "
-                        f"{d.get('dif_on_signal', 0):>10.4f}")
-        logger.info("-" * 100)
+    try:
+        base_dt = datetime.strptime(
+            signal_date or datetime.now().strftime('%Y-%m-%d'), '%Y-%m-%d'
+        )
+    except ValueError:
+        logger.error("日期格式错误")
+        return
 
-    # ---- Step 3: 验证（如果开启） ----
-    if not no_verify and total > 0:
-        # verify_macd_predictions 已经跑过验证（forward_days > 0 时）
-        # 但为了让报告好看，这里重新跑一次专门的验证
-        # 其实上面的 result 已经包含验证数据，直接复用打印
-        _print_macd_verify_report(result)
-    elif no_verify:
-        logger.info(f"  (--no-verify 已设置，跳过验证)")
+    start_lookup = (base_dt - timedelta(days=60)).strftime('%Y-%m-%d')
+    end_lookup = (base_dt + timedelta(days=forward_days + 10)).strftime('%Y-%m-%d')
 
-    logger.info("")
+    cross_1d = cross_3d = cross_5d = 0
+    bar_ok_1d = 0
+    pct_1d_vals, pct_3d_vals, pct_5d_vals = [], [], []
+    unverifiable = 0
+    detail_rows = []
+
+    for sig in all_signals:
+        code = sig['code']
+        df_fwd = get_daily_kline_df(code, start_date=start_lookup, end_date=end_lookup)
+        if df_fwd.empty or len(df_fwd) < 35:
+            unverifiable += 1
+            detail_rows.append({**sig, 'note': '无后续K线数据'})
+            continue
+
+        df_ind = calc_all_indicators(df_fwd)
+        if df_ind.empty:
+            unverifiable += 1
+            detail_rows.append({**sig, 'note': '无后续K线数据'})
+            continue
+
+        # 定位信号日在后续扩展K线中的索引
+        sig_day = sig['signal_time']
+        sig_idx = None
+        for i in range(len(df_ind)):
+            if str(df_ind['date'].iloc[i]) == sig_day:
+                sig_idx = i
+                break
+        if sig_idx is None:
+            sig_idx = len(df_ind) - 1
+
+        max_fwd = min(len(df_ind) - sig_idx - 1, forward_days)
+        if max_fwd <= 0:
+            unverifiable += 1
+            detail_rows.append({**sig, 'note': '无后续K线数据'})
+            continue
+
+        sig_price = sig['close_on_signal']
+        dif_on_sig = sig['dif_on_signal']
+        dea_on_sig = sig['dea_on_signal']
+        macd_on_sig = sig['macd_on_signal']
+
+        # --- 金叉检测：DIF 从 < DEA 变成 >= DEA ---
+        days_to_cross = None
+        for j in range(1, max_fwd + 1):
+            cur_idx = sig_idx + j
+            dif_j = float(df_ind['dif'].iloc[cur_idx])
+            dea_j = float(df_ind['dea'].iloc[cur_idx])
+            prev_dif = dif_on_sig if j == 1 else float(df_ind['dif'].iloc[cur_idx - 1])
+            prev_dea = dea_on_sig if j == 1 else float(df_ind['dea'].iloc[cur_idx - 1])
+            if (prev_dif < prev_dea) and (dif_j >= dea_j):
+                days_to_cross = j
+                break
+
+        # --- MACD柱次日继续增大 ---
+        bar_ok = None
+        if max_fwd >= 1:
+            bar_ok = float(df_ind['macd'].iloc[sig_idx + 1]) > macd_on_sig
+
+        # --- 涨跌幅 ---
+        def _pct(offset):
+            if offset > max_fwd or sig_idx + offset >= len(df_ind):
+                return None
+            cl = float(df_ind['close'].iloc[sig_idx + offset])
+            return round((cl - sig_price) / sig_price * 100, 2) if sig_price else None
+
+        p1, p3, p5 = _pct(1), _pct(3), _pct(5)
+
+        if days_to_cross is not None:
+            if days_to_cross <= 1: cross_1d += 1
+            if days_to_cross <= 3: cross_3d += 1
+            if days_to_cross <= 5: cross_5d += 1
+        if bar_ok:
+            bar_ok_1d += 1
+        if p1 is not None: pct_1d_vals.append(p1)
+        if p3 is not None: pct_3d_vals.append(p3)
+        if p5 is not None: pct_5d_vals.append(p5)
+
+        detail_rows.append({**sig, 'days_to_cross': days_to_cross, 'bar_continued_1d': bar_ok,
+                             'pct_1d': p1, 'pct_3d': p3, 'pct_5d': p5})
+
+    # --- 汇总 ---
+    verifiable = len(all_signals) - unverifiable
+    def _avg(vals): return round(sum(vals) / len(vals), 2) if vals else None
+
+    logger.info(f"  可验证: {verifiable} 只   无后续数据: {unverifiable} 只")
+    logger.info("-" * 50)
+    logger.info(f"  金叉形成:")
+    logger.info(f"    次日金叉: {cross_1d} 只   命中率: {round(cross_1d / verifiable * 100, 1) if verifiable else '-'}%")
+    logger.info(f"    3日内金叉: {cross_3d} 只   命中率: {round(cross_3d / verifiable * 100, 1) if verifiable else '-'}%")
+    logger.info(f"    5日内金叉: {cross_5d} 只   命中率: {round(cross_5d / verifiable * 100, 1) if verifiable else '-'}%")
+    logger.info(f"  MACD柱次日继续增大: {bar_ok_1d} 只   命中率: {round(bar_ok_1d / verifiable * 100, 1) if verifiable else '-'}%")
+    logger.info(f"  股价表现: 次日均价={_avg(pct_1d_vals)}%   3日均价={_avg(pct_3d_vals)}%   5日均价={_avg(pct_5d_vals)}%")
+    logger.info("=" * 95)
+
+    logger.info(f"  {'序号':>3} {'代码':<12} {'名称':<10} {'信号价':>8} {'几日金叉':>8} {'次日柱增大':>10} {'1日%':>7} {'3日%':>7} {'5日%':>7}  备注")
+    logger.info("-" * 130)
+    for i, d in enumerate(detail_rows, 1):
+        cross_flag = str(d['days_to_cross']) if d.get('days_to_cross') is not None else '未金叉'
+        bar_flag = 'OK' if d.get('bar_continued_1d') is True else ('--' if d.get('bar_continued_1d') is False else '-')
+        p1 = f"{d['pct_1d']:.2f}" if d.get('pct_1d') is not None else '-'
+        p3 = f"{d['pct_3d']:.2f}" if d.get('pct_3d') is not None else '-'
+        p5 = f"{d['pct_5d']:.2f}" if d.get('pct_5d') is not None else '-'
+        note = d.get('note', '')[:30]
+        logger.info(f"  {i:>3} {d['code']:<12} {d.get('name', ''):<10} {d['close_on_signal']:>8.2f} "
+                    f"{cross_flag:>8} {bar_flag:>10} {p1:>7} {p3:>7} {p5:>7}  {note}")
+    logger.info("=" * 95)
+
+
 
 
 if __name__ == '__main__':
