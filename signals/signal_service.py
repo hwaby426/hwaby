@@ -86,14 +86,9 @@ def generate_latest_daily_signal(
 
     信号语义：
         - 总是检查最后一根K线（last_idx）是否形成信号
-        - 不传 --date（实时/盘中扫描）：
-            * 最后一行 = 今日合成K线（带实时行情）
-            * signal_time = 最后一根K线日期（今日/扫描当日）
-            * price = 最后一行 close（即实时价格）
-        - 传 --date（历史扫描）：
-            * 最后一行 = 指定日期的历史K线
-            * signal_time = 下一交易日（= 指定日期 + 1工作日，跳过周末）
-            * price = 下一交易日 open（由调用方在信号后重写，因为本函数只拿到指定日期之前的数据）
+        - signal_time = 最后一根K线日期（信号出现的当日）
+        - price = 最后一根K线的 close
+        - 注：历史扫描模式下，调用方会将 price 重写为下一交易日 open，但 signal_time 不变
     """
     if df_daily.empty or len(df_daily) < 35:
         return []
@@ -106,18 +101,8 @@ def generate_latest_daily_signal(
     last_idx = len(df) - 1
     last_date = str(df['date'].iloc[last_idx]) if 'date' in df.columns else ''
 
-    # 历史模式下：signal_time = 下一交易日
+    # signal_time 始终 = 信号出现的日期（最后一根K线日期）
     signal_time_str = last_date
-    if historical_mode and 'date' in df.columns:
-        from datetime import datetime, timedelta
-        try:
-            base_date = datetime.strptime(last_date, '%Y-%m-%d')
-            next_day = base_date + timedelta(days=1)
-            while next_day.weekday() >= 5:
-                next_day += timedelta(days=1)
-            signal_time_str = next_day.strftime('%Y-%m-%d')
-        except (ValueError, TypeError):
-            pass
 
     if strategy_names:
         strategies = [get_strategy(name, check_volume=check_volume) for name in strategy_names]

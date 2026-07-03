@@ -49,3 +49,7 @@ python main.py analyze_macd_signals
 
 ## 计算指定某天出现信号的数据, 在end结束日期的close价格的盈利情况(示例数据为26号出现信号的数据, 计算27号买入到30号收盘的盈利)
 python main.py macd-intraday-pnl-from-db --start  2026-06-26  --end 2026-06-30
+
+
+## 计算预测MACD金叉信号的收益
+python main.py verify-macd-prediction --start 2026-07-02 --codes sz.301028
