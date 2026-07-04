@@ -8,6 +8,7 @@
 from typing import List, Dict, Optional
 from dataclasses import dataclass, field
 import pandas as pd
+import re
 from loguru import logger
 
 from backtest.engine import BacktestResult
@@ -944,6 +945,32 @@ def verify_macd_predictive_signals(
         logger.info("没有可用于验证的信号数据")
         return result_df
 
+    # 解析每条信号的辅助指标：强度 strength / 量比 / 需涨% / 3日缩短%
+    # 从 reason 文本中提取："3日缩短XX%" / "需涨XX.XX%" / "量比=XX.XX"
+    def _parse_reason(r):
+        if not r:
+            return {}
+        out = {}
+        m1 = re.search(r'3日缩短([\d.]+)%', r)
+        if m1:
+            out['shrink_pct'] = float(m1.group(1))
+        m2 = re.search(r'需涨([\d.]+)%', r)
+        if m2:
+            out['needed_pct'] = float(m2.group(1))
+        m3 = re.search(r'量比=([\d.]+)', r)
+        if m3:
+            out['vol_ratio'] = float(m3.group(1))
+        return out
+
+    parsed_flags = []
+    for _, row in result_df.iterrows():
+        info = _parse_reason(row.get('reason', ''))
+        try:
+            info['strength'] = float(row['strength']) if row.get('strength') is not None else float('nan')
+        except (ValueError, TypeError):
+            info['strength'] = float('nan')
+        parsed_flags.append(info)
+
     # 汇总统计
     total_signals = len(result_df)
     n_increase_next = sum(1 for r in result_df['macd_increase_next'] if r == '✓')
@@ -972,6 +999,72 @@ def verify_macd_predictive_signals(
                     f"{win / cnt * 100:.1f}% ({win}/{cnt})")
     if skipped > 0:
         logger.info(f"  (跳过 {skipped} 只无K线数据 / 信号日无数据的股票)")
+    logger.info("-" * 70)
+
+    # —— 按各参数阈值分层统计，帮助判断是否需要调整 ——
+    # 使用最后一个窗口日作为"盈亏"基准
+    metric_col = f'ret_{check_window}d_pct'
+    has_metric = result_df[result_df[metric_col].notna()]
+    if len(has_metric) == 0:
+        metric_col = 'ret_1d_pct'
+        has_metric = result_df[result_df[metric_col].notna()]
+
+    def _segment_stats(key, buckets, label):
+        """buckets = [(name, predicate(df_row, parsed_row))]"""
+        lines = []
+        for bname, pred in buckets:
+            idxs = [i for i in range(len(result_df)) if pred(result_df.iloc[i], parsed_flags[i])]
+            sub = result_df.iloc[idxs]
+            sub_valid = sub[sub[metric_col].notna()]
+            sub_cross = sum(1 for r in sub['cross_within_window'] if r == '✓')
+            sub_avg = sub_valid[metric_col].mean() if not sub_valid.empty else float('nan')
+            sub_win = sum(1 for r in sub_valid[metric_col] if r > 0)
+            lines.append((bname, len(sub), sub_cross, sub_avg, sub_win, len(sub_valid)))
+        logger.info(f"  — {label}（样本数 / {check_window}日金叉命中率 / 平均涨幅 / 上涨概率）—")
+        for bname, cnt, cr, avg, win, vcnt in lines:
+            cross_pct = (cr / cnt * 100) if cnt > 0 else 0.0
+            avg_str = f"{avg:.2f}%" if pd.notna(avg) else "N/A"
+            win_pct = f"{win / vcnt * 100:.1f}%" if vcnt > 0 else "N/A"
+            logger.info(f"    {bname:<16} 样本={cnt:<4} 金叉命中={cr}/{cnt} "
+                        f"({cross_pct:.1f}%)  平均涨幅={avg_str:<7}  上涨概率={win_pct} ({win}/{vcnt})")
+
+    # 1) 信号强度分段
+    _segment_stats('strength', [
+        ('strength ≥ 85',   lambda r, p: pd.notna(p.get('strength')) and p['strength'] >= 85),
+        ('80 ≤ strength<85', lambda r, p: pd.notna(p.get('strength')) and 80 <= p['strength'] < 85),
+        ('70 ≤ strength<80', lambda r, p: pd.notna(p.get('strength')) and 70 <= p['strength'] < 80),
+        ('strength < 70',   lambda r, p: pd.notna(p.get('strength')) and p['strength'] < 70),
+        ('无强度数据',       lambda r, p: pd.isna(p.get('strength'))),
+    ], '信号强度 strength')
+
+    # 2) 量比分段
+    _segment_stats('vol_ratio', [
+        ('量比 ≥ 2.0', lambda r, p: pd.notna(p.get('vol_ratio')) and p['vol_ratio'] >= 2.0),
+        ('1.5 ≤ 量比<2.0', lambda r, p: pd.notna(p.get('vol_ratio')) and 1.5 <= p['vol_ratio'] < 2.0),
+        ('1.25 ≤ 量比<1.5', lambda r, p: pd.notna(p.get('vol_ratio')) and 1.25 <= p['vol_ratio'] < 1.5),
+        ('1.0 ≤ 量比<1.25', lambda r, p: pd.notna(p.get('vol_ratio')) and 1.0 <= p['vol_ratio'] < 1.25),
+        ('量比 < 1.0',  lambda r, p: pd.notna(p.get('vol_ratio')) and p['vol_ratio'] < 1.0),
+        ('无量比数据', lambda r, p: pd.isna(p.get('vol_ratio'))),
+    ], '量比（vol / vol_ma20）')
+
+    # 3) 需涨幅度分段
+    _segment_stats('needed_pct', [
+        ('需涨 < 1%',   lambda r, p: pd.notna(p.get('needed_pct')) and p['needed_pct'] < 1.0),
+        ('1% ≤ 需涨<2%', lambda r, p: pd.notna(p.get('needed_pct')) and 1.0 <= p['needed_pct'] < 2.0),
+        ('2% ≤ 需涨<3%', lambda r, p: pd.notna(p.get('needed_pct')) and 2.0 <= p['needed_pct'] < 3.0),
+        ('3% ≤ 需涨<5%', lambda r, p: pd.notna(p.get('needed_pct')) and 3.0 <= p['needed_pct'] < 5.0),
+        ('无需涨数据',   lambda r, p: pd.isna(p.get('needed_pct'))),
+    ], '需涨幅度（明日触发金叉所需涨幅）')
+
+    # 4) 3日缩短比例分段
+    _segment_stats('shrink_pct', [
+        ('缩短 ≥ 70%', lambda r, p: pd.notna(p.get('shrink_pct')) and p['shrink_pct'] >= 70),
+        ('50% ≤ 缩短<70%', lambda r, p: pd.notna(p.get('shrink_pct')) and 50 <= p['shrink_pct'] < 70),
+        ('30% ≤ 缩短<50%', lambda r, p: pd.notna(p.get('shrink_pct')) and 30 <= p['shrink_pct'] < 50),
+        ('缩短 < 30%', lambda r, p: pd.notna(p.get('shrink_pct')) and p['shrink_pct'] < 30),
+        ('无缩短数据', lambda r, p: pd.isna(p.get('shrink_pct'))),
+    ], '3日缩短比例')
+
     logger.info("-" * 70)
 
     # 打印明细表
