@@ -188,7 +188,7 @@ class MACDPredictiveCrossStrategy(BaseStrategy):
       1. MACD柱 < 0              → 当前仍处于绿柱区（DIF < DEA）
       2. MACD柱连续3天增大        → MACD[i] > MACD[i-1] > MACD[i-2] > MACD[i-3]
       3. DIF拐头向上              → DIF[i] > DIF[i-1] 且 DIF[i-1] <= DIF[i-2]
-      4. 当日成交量 > 20日均量     → volume[i] > vol_ma20[i]
+      4. 当日成交量 ≥ 1.25 × 20日均量  → volume[i] >= 1.25 * vol_ma20[i]
     """
 
     name = "MACD预测金叉"
@@ -236,11 +236,11 @@ class MACDPredictiveCrossStrategy(BaseStrategy):
             if not (dif[i] > dif[i-1]):
                 continue
 
-            # 条件 5：当日成交量 > 20 日均量
+            # 条件 5：当日成交量 ≥ 1.25 × 20 日均量（放量确认）
             if vol is not None and vol_ma20 is not None:
                 if np.isnan(vol[i]) or np.isnan(vol_ma20[i]) or vol_ma20[i] <= 0:
                     continue
-                if not (vol[i] > vol_ma20[i]):
+                if not (vol[i] >= 1.25 * vol_ma20[i]):
                     continue
 
             # 条件 6：明天涨幅 < 5% 即可出现金叉
