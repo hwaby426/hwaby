@@ -1065,6 +1065,26 @@ def verify_macd_predictive_signals(
         ('无缩短数据', lambda r, p: pd.isna(p.get('shrink_pct'))),
     ], '3日缩短比例')
 
+    # 5) 信号日股价区间分段（使用 signal_close 列）
+    # 在 parsed_flags 中预先提取价格值，避免 lambda 里反复容错
+    for i, (_, row) in enumerate(result_df.iterrows()):
+        if i >= len(parsed_flags):
+            parsed_flags.append({})
+        v = row.get('signal_close')
+        try:
+            parsed_flags[i]['price_val'] = float(v)
+        except (ValueError, TypeError):
+            parsed_flags[i]['price_val'] = float('nan')
+
+    _segment_stats('price', [
+        ('股价 < 5',    lambda r, p: pd.notna(p.get('price_val')) and p['price_val'] < 5),
+        ('5 ≤ 股价 < 10', lambda r, p: pd.notna(p.get('price_val')) and 5 <= p['price_val'] < 10),
+        ('10 ≤ 股价 < 20', lambda r, p: pd.notna(p.get('price_val')) and 10 <= p['price_val'] < 20),
+        ('20 ≤ 股价 < 50', lambda r, p: pd.notna(p.get('price_val')) and 20 <= p['price_val'] < 50),
+        ('股价 ≥ 50',   lambda r, p: pd.notna(p.get('price_val')) and p['price_val'] >= 50),
+        ('无股价数据',  lambda r, p: pd.isna(p.get('price_val')) or p.get('price_val') is None),
+    ], '信号日股价区间（元）')
+
     logger.info("-" * 70)
 
     # 打印明细表
