@@ -657,14 +657,12 @@ def macd_intraday_pnl_from_db(start, end, codes):
 
 
 @cli.command('verify-macd-prediction')
-@click.option('--start', 'start_date', required=True, help='分析起始日期 YYYY-MM-DD')
-@click.option('--end', 'end_date', default=None, help='分析截止日期 YYYY-MM-DD，默认今天')
-@click.option('--codes', default=None, help='股票代码列表，逗号分隔。不传则全市场')
+@click.option('--start', 'check_date', required=True, help='信号检查日期 YYYY-MM-DD（即 scan-market --date 的日期）')
+@click.option('--codes', default=None, help='股票代码列表，逗号分隔。不传则验证所有在该日有信号的股票')
 @click.option('--window', 'check_window', default=1, type=int, help='向后检查多少个交易日内是否出现金叉，默认 1')
 @click.option('--max-print', default=500, type=int, help='明细最多打印多少行，默认 500')
-@click.option('--no-volume', is_flag=True, default=False, help='关闭成交量过滤（预测信号默认开启量比）')
-def verify_macd_prediction(start_date, end_date, codes, check_window, max_print, no_volume):
-    """验证 MACD 预测金叉信号：统计次日是否出现 MACD 柱增大 / 金叉，以及 1/3/5 日涨跌幅"""
+def verify_macd_prediction(check_date, codes, check_window, max_print):
+    """验证 MACD 预测金叉信号：从 trade_signals 读取指定日期信号，检查后续 N 天是否出现真正金叉"""
     from data_fetcher.stock_pool import get_stock_name_map
     from analysis.strategy_compare import verify_macd_predictive_signals
 
@@ -673,12 +671,10 @@ def verify_macd_prediction(start_date, end_date, codes, check_window, max_print,
 
     verify_macd_predictive_signals(
         codes=code_list,
-        start_date=start_date,
-        end_date=end_date,
+        check_date=check_date,
         check_window=check_window,
         name_map=name_map,
         max_print=max_print,
-        no_volume=no_volume,
     )
 
 
