@@ -881,14 +881,13 @@ def verify_macd_predictive_signals(
         dif_i = float(df_ind['dif'].values[signal_idx])
         dea_i = float(df_ind['dea'].values[signal_idx])
 
-        # —— 向后检查金叉 / MACD柱增大 / 涨跌幅 ——
+        # —— 向后检查金叉 / MACD柱增大 / 窗口日收益率 ——
         macd_increase_next = False
         next_macd_val = float('nan')
         cross_day = None
         cross_date = None
-        ret_1d = float('nan')
-        ret_3d = float('nan')
-        ret_5d = float('nan')
+        # ret_per_day[k] = 到第 k 个交易日收盘价相对信号日的收益率 (k = 1..check_window)
+        ret_per_day = {k: float('nan') for k in range(1, check_window + 1)}
 
         n = len(df_ind)
         for k in range(1, check_window + 1):
@@ -905,7 +904,6 @@ def verify_macd_predictive_signals(
                 next_macd_val = macd_j
                 if macd_j > macd_i:
                     macd_increase_next = True
-                ret_1d = (close_j - close_i) / close_i * 100.0
 
             # 真正金叉：DIF 从下方穿过 DEA
             prev_dif = float(df_ind['dif'].values[j - 1])
@@ -915,14 +913,12 @@ def verify_macd_predictive_signals(
                     cross_day = k
                     cross_date = str(df_ind['date'].iloc[j])
 
-            if k == 3:
-                ret_3d = (close_j - close_i) / close_i * 100.0
-            if k == 5:
-                ret_5d = (close_j - close_i) / close_i * 100.0
+            # 窗口内每个交易日的收益率
+            ret_per_day[k] = (close_j - close_i) / close_i * 100.0
 
         info = signal_info.get(code, {})
         name = nm.get(code, '')
-        detail_rows.append({
+        row_dict = {
             'code': code,
             'name': name,
             'signal_date': signal_date,
@@ -938,10 +934,10 @@ def verify_macd_predictive_signals(
             'cross_within_window': '✓' if cross_day is not None else '✗',
             'cross_day': cross_day if cross_day is not None else '',
             'cross_date': cross_date or '',
-            'ret_1d_pct': round(ret_1d, 2),
-            'ret_3d_pct': round(ret_3d, 2),
-            'ret_5d_pct': round(ret_5d, 2),
-        })
+        }
+        for k in range(1, check_window + 1):
+            row_dict[f'ret_{k}d_pct'] = round(ret_per_day[k], 2)
+        detail_rows.append(row_dict)
 
     result_df = pd.DataFrame(detail_rows)
     if result_df.empty:
@@ -952,15 +948,15 @@ def verify_macd_predictive_signals(
     total_signals = len(result_df)
     n_increase_next = sum(1 for r in result_df['macd_increase_next'] if r == '✓')
     n_cross = sum(1 for r in result_df['cross_within_window'] if r == '✓')
-    valid_1d = result_df[result_df['ret_1d_pct'].notna()]
-    valid_3d = result_df[result_df['ret_3d_pct'].notna()]
-    valid_5d = result_df[result_df['ret_5d_pct'].notna()]
-    avg_1d = valid_1d['ret_1d_pct'].mean() if not valid_1d.empty else 0
-    avg_3d = valid_3d['ret_3d_pct'].mean() if not valid_3d.empty else 0
-    avg_5d = valid_5d['ret_5d_pct'].mean() if not valid_5d.empty else 0
-    win_1d = sum(1 for r in valid_1d['ret_1d_pct'] if r > 0)
-    win_3d = sum(1 for r in valid_3d['ret_3d_pct'] if r > 0)
-    win_5d = sum(1 for r in valid_5d['ret_5d_pct'] if r > 0)
+
+    # 按窗口内每个交易日计算平均涨幅和上涨概率
+    day_stats = []
+    for k in range(1, check_window + 1):
+        col = f'ret_{k}d_pct'
+        valid = result_df[result_df[col].notna()]
+        avg = valid[col].mean() if not valid.empty else 0
+        win = sum(1 for r in valid[col] if r > 0)
+        day_stats.append((k, len(valid), avg, win))
 
     logger.info("=" * 70)
     logger.info(f"验证完成：共 {total_signals} 个「MACD预测金叉」信号")
@@ -968,15 +964,12 @@ def verify_macd_predictive_signals(
                 f"({n_increase_next / total_signals * 100:.1f}%)")
     logger.info(f"  ├─ {check_window} 日内出现 MACD 金叉: {n_cross}/{total_signals} "
                 f"({n_cross / total_signals * 100:.1f}% 金叉命中率)")
-    if len(valid_1d):
-        logger.info(f"  ├─ 次日平均涨幅: {avg_1d:.2f}% · 上涨概率: "
-                    f"{win_1d / len(valid_1d) * 100:.1f}% ({win_1d}/{len(valid_1d)})")
-    if len(valid_3d):
-        logger.info(f"  ├─ 3日平均涨幅: {avg_3d:.2f}% · 上涨概率: "
-                    f"{win_3d / len(valid_3d) * 100:.1f}% ({win_3d}/{len(valid_3d)})")
-    if len(valid_5d):
-        logger.info(f"  └─ 5日平均涨幅: {avg_5d:.2f}% · 上涨概率: "
-                    f"{win_5d / len(valid_5d) * 100:.1f}% ({win_5d}/{len(valid_5d)})")
+    for idx, (k, cnt, avg, win) in enumerate(day_stats):
+        if cnt == 0:
+            continue
+        prefix = '  ├─' if idx < len(day_stats) - 1 else '  └─'
+        logger.info(f"{prefix} 第{k}日收盘平均涨幅: {avg:.2f}% · 上涨概率: "
+                    f"{win / cnt * 100:.1f}% ({win}/{cnt})")
     if skipped > 0:
         logger.info(f"  (跳过 {skipped} 只无K线数据 / 信号日无数据的股票)")
     logger.info("-" * 70)
@@ -998,12 +991,12 @@ def verify_macd_predictive_signals(
         table.add_column("次日柱增大", justify="center")
         table.add_column(f"{check_window}日内金叉", justify="center")
         table.add_column("金叉日", justify="center")
-        table.add_column("1日%", justify="right", style="bold green")
-        table.add_column("3日%", justify="right")
-        table.add_column("5日%", justify="right")
+        for k in range(1, check_window + 1):
+            style = "bold green" if k == 1 else ""
+            table.add_column(f"{k}日%", justify="right", style=style)
 
         for idx, row in result_df.head(max_print).iterrows():
-            table.add_row(
+            cells = [
                 str(idx + 1),
                 row['code'],
                 str(row['name']),
@@ -1013,23 +1006,27 @@ def verify_macd_predictive_signals(
                 row['macd_increase_next'],
                 row['cross_within_window'],
                 row['cross_date'] if row['cross_date'] else '—',
-                f"{row['ret_1d_pct']:.2f}",
-                f"{row['ret_3d_pct']:.2f}",
-                f"{row['ret_5d_pct']:.2f}",
-            )
+            ]
+            for k in range(1, check_window + 1):
+                col = f'ret_{k}d_pct'
+                val = row[col]
+                cells.append(f"{val:.2f}")
+            table.add_row(*cells)
         console.print(table)
         if len(result_df) > max_print:
             logger.info(f"  表格只显示前 {max_print} 条，其余 {len(result_df) - max_print} 条省略")
     except Exception:
         for idx, row in result_df.head(max_print).iterrows():
+            ret_parts = " ".join(
+                f"{k}日={row[f'ret_{k}d_pct']:.2f}%" for k in range(1, check_window + 1)
+            )
             logger.info(
                 f"  {idx + 1:>3}. {row['code']} {row['name']} "
                 f"信号:{row['signal_date']}[MACD={row['macd_at_signal']:.4f}] "
                 f"次日MACD={row['next_day_macd']:.4f} "
                 f"柱增大={row['macd_increase_next']} "
                 f"{check_window}日内金叉={row['cross_within_window']} "
-                f"({row['cross_date'] or '—'}) "
-                f"1日={row['ret_1d_pct']:.2f}% 3日={row['ret_3d_pct']:.2f}% 5日={row['ret_5d_pct']:.2f}%"
+                f"({row['cross_date'] or '—'}) {ret_parts}"
             )
 
     logger.info("-" * 70)
@@ -1042,111 +1039,9 @@ def verify_macd_predictive_signals(
                 'strength', 'reason', 'macd_at_signal',
                 'dif_at_signal', 'dea_at_signal', 'next_day_macd',
                 'macd_increase_next',
-                'cross_within_window', 'cross_day', 'cross_date',
-                'ret_1d_pct', 'ret_3d_pct', 'ret_5d_pct']
-        result_df[cols].to_csv(csv_path, index=False, encoding='utf-8-sig')
-        logger.info(f"验证结果已导出 CSV: {csv_path} (共 {len(result_df)} 条)")
-    except Exception as e:
-        logger.warning(f"导出 CSV 失败: {e}")
-
-    return result_df
-
-
-    # 汇总统计
-    total_signals = len(result_df)
-    n_increase_next = sum(1 for r in result_df['macd_increase_next'] if r == '✓')
-    n_cross = sum(1 for r in result_df['cross_within_window'] if r == '✓')
-    valid_1d = result_df[result_df['ret_1d_pct'].notna()]
-    valid_3d = result_df[result_df['ret_3d_pct'].notna()]
-    valid_5d = result_df[result_df['ret_5d_pct'].notna()]
-    avg_1d = valid_1d['ret_1d_pct'].mean() if not valid_1d.empty else 0
-    avg_3d = valid_3d['ret_3d_pct'].mean() if not valid_3d.empty else 0
-    avg_5d = valid_5d['ret_5d_pct'].mean() if not valid_5d.empty else 0
-    win_1d = sum(1 for r in valid_1d['ret_1d_pct'] if r > 0)
-    win_3d = sum(1 for r in valid_3d['ret_3d_pct'] if r > 0)
-    win_5d = sum(1 for r in valid_5d['ret_5d_pct'] if r > 0)
-
-    logger.info("=" * 70)
-    logger.info(f"验证完成：共 {total_signals} 个「MACD预测金叉」信号")
-    logger.info(f"  ┌─ 次日 MACD 柱继续增大: {n_increase_next}/{total_signals} "
-                f"({n_increase_next / total_signals * 100:.1f}%)")
-    logger.info(f"  ├─ {check_window} 日内出现 MACD 金叉: {n_cross}/{total_signals} "
-                f"({n_cross / total_signals * 100:.1f}% 金叉命中率)")
-    if len(valid_1d):
-        logger.info(f"  ├─ 次日平均涨幅: {avg_1d:.2f}% · 上涨概率: "
-                    f"{win_1d / len(valid_1d) * 100:.1f}% ({win_1d}/{len(valid_1d)})")
-    if len(valid_3d):
-        logger.info(f"  ├─ 3日平均涨幅: {avg_3d:.2f}% · 上涨概率: "
-                    f"{win_3d / len(valid_3d) * 100:.1f}% ({win_3d}/{len(valid_3d)})")
-    if len(valid_5d):
-        logger.info(f"  └─ 5日平均涨幅: {avg_5d:.2f}% · 上涨概率: "
-                    f"{win_5d / len(valid_5d) * 100:.1f}% ({win_5d}/{len(valid_5d)})")
-    if skipped > 0:
-        logger.info(f"  (跳过 {skipped} 只无K线数据 / 信号日无数据的股票)")
-    logger.info("-" * 70)
-
-    # 打印明细表
-    try:
-        from rich.console import Console
-        from rich.table import Table
-        console = Console()
-        title = (f"「MACD预测金叉」信号验证明细 · 共 {total_signals} 条 · "
-                 f"显示前 {min(max_print, total_signals)} 条")
-        table = Table(title=title, show_lines=False)
-        table.add_column("#", justify="center", style="cyan")
-        table.add_column("代码", style="magenta")
-        table.add_column("名称")
-        table.add_column("信号日", justify="center")
-        table.add_column("信号日MACD", justify="right")
-        table.add_column("次日MACD", justify="right")
-        table.add_column("次日柱增大", justify="center")
-        table.add_column(f"{check_window}日内金叉", justify="center")
-        table.add_column("金叉日", justify="center")
-        table.add_column("1日%", justify="right", style="bold green")
-        table.add_column("3日%", justify="right")
-        table.add_column("5日%", justify="right")
-
-        for idx, row in result_df.head(max_print).iterrows():
-            table.add_row(
-                str(idx + 1),
-                row['code'],
-                str(row['name']),
-                row['signal_date'],
-                f"{row['macd_at_signal']:.4f}",
-                f"{row['next_day_macd']:.4f}",
-                row['macd_increase_next'],
-                row['cross_within_window'],
-                row['cross_date'] if row['cross_date'] else '—',
-                f"{row['ret_1d_pct']:.2f}",
-                f"{row['ret_3d_pct']:.2f}",
-                f"{row['ret_5d_pct']:.2f}",
-            )
-        console.print(table)
-        if len(result_df) > max_print:
-            logger.info(f"  表格只显示前 {max_print} 条，其余 {len(result_df) - max_print} 条省略")
-    except Exception as e:
-        for idx, row in result_df.head(max_print).iterrows():
-            logger.info(
-                f"  {idx + 1:>3}. {row['code']} {row['name']} "
-                f"信号:{row['signal_date']}[MACD={row['macd_at_signal']:.4f}] "
-                f"次日MACD={row['next_day_macd']:.4f} "
-                f"柱增大={row['macd_increase_next']} "
-                f"{check_window}日内金叉={row['cross_within_window']} "
-                f"({row['cross_date'] or '—'}) "
-                f"1日={row['ret_1d_pct']:.2f}% 3日={row['ret_3d_pct']:.2f}% 5日={row['ret_5d_pct']:.2f}%"
-            )
-
-    logger.info("-" * 70)
-
-    # 导出 CSV（完整数据）
-    try:
-        csv_path = settings.OUTPUT_DIR / f"macd_prediction_verify_{_dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        csv_path.parent.mkdir(parents=True, exist_ok=True)
-        cols = ['code', 'name', 'signal_date', 'signal_close', 'macd_at_signal',
-                'dif_at_signal', 'dea_at_signal', 'next_day_macd',
-                'macd_increase_next',
-                'cross_within_window', 'cross_day', 'cross_date',
-                'ret_1d_pct', 'ret_3d_pct', 'ret_5d_pct']
+                'cross_within_window', 'cross_day', 'cross_date']
+        for k in range(1, check_window + 1):
+            cols.append(f'ret_{k}d_pct')
         result_df[cols].to_csv(csv_path, index=False, encoding='utf-8-sig')
         logger.info(f"验证结果已导出 CSV: {csv_path} (共 {len(result_df)} 条)")
     except Exception as e:
