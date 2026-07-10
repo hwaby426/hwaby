@@ -100,6 +100,24 @@ COMMAND_META = {
             {"name": "no_volume", "label": "关闭成交量过滤", "type": "flag", "default": False, "help": "MACD金叉策略专用，默认开启放量过滤"},
         ],
     },
+    "scan-macd-predictive": {
+        "title": "MACD 预测金叉扫描（专用）",
+        "description": "专门扫描「MACD预测金叉」策略（底部预判型）。条件：MACD柱<0 且 从前天到今天回升≥30%，DIF拐头向上，收盘价站 MA5/MA10/MA20 中任意一条，阳线+量比>1.1。自动过滤科创板/北交所。",
+        "category": "信号扫描",
+        "params": [
+            {"name": "signal_type", "label": "信号类型", "type": "select", "default": "buy",
+             "help": "buy=买入信号，sell=卖出信号，all=全部",
+             "options": [{"value": "buy", "label": "买入"}, {"value": "sell", "label": "卖出"}, {"value": "all", "label": "全部"}]},
+            {"name": "min_price", "label": "最低价", "type": "number", "default": "2.0", "help": "最低价格过滤"},
+            {"name": "max_price", "label": "最高价", "type": "number", "default": "200.0", "help": "最高价格过滤"},
+            {"name": "no_save", "label": "不保存到数据库", "type": "flag", "default": False, "help": "仅打印，不写入数据库"},
+            {"name": "date", "label": "扫描日期", "type": "date", "default": "", "help": "YYYY-MM-DD，留空=盘中实时扫描"},
+            {"name": "codes", "label": "指定股票", "type": "text", "default": "",
+             "help": "逗号分隔，如 sh.600519。传此值时每只股票会打印各条件是否满足的明细"},
+        ],
+        "_fixed_args": {"strategies": "MACD预测金叉"},
+        "_command_alias": "scan-market",
+    },
     "scan": {
         "title": "扫描日线买卖信号",
         "description": "从数据库 trade_signals 表中查询历史信号（需先有 scan-market/update-daily 写入过数据）",
@@ -399,13 +417,25 @@ def _execute_command(task_id: str, cmd_name: str, params: dict, capture: StreamL
         # 参数名向后兼容
         params = _normalize_params(params)
 
-        # 从 COMMAND_META 生成命令行参数
+        # 从 COMMAND_META 生成命令行参数（支持固定参数 _fixed_args，支持别名 _command_alias 指向真正的 click 命令）
         meta = COMMAND_META[cmd_name]
-        click_args = [cmd_name]
+        target_cmd = meta.get("_command_alias", cmd_name)
+        click_args = [target_cmd]
+        fixed_args = meta.get("_fixed_args", {})
+        merged_params = dict(params)
+        merged_params.update(fixed_args)
+        # 把 _fixed_args 也扩展成 meta["params"] 里的参数样式（让下面的循环能识别）
+        param_names = {p["name"] for p in meta["params"]}
+        for fixed_name, fixed_val in fixed_args.items():
+            if fixed_name not in param_names:
+                meta["params"].append({"name": fixed_name, "type": "text", "default": str(fixed_val)})
         for p in meta["params"]:
             pname = p["name"]
             ptype = p["type"]
-            val = params.get(pname, p.get("default", ""))
+            if pname in fixed_args:
+                val = fixed_args[pname]
+            else:
+                val = merged_params.get(pname, p.get("default", ""))
 
             if ptype == "flag":
                 if val or str(val).lower() in ("true", "1", "yes", "on"):

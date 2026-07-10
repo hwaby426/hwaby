@@ -62,6 +62,36 @@ def _print_progress(total, pool_size, buy_count, sell_count, elapsed_sec, extra=
     )
 
 
+def _is_restricted(code: str) -> bool:
+    """判断股票是否属于受限板块（科创板/北交所），无权限交易。
+
+    规则（覆盖 normalize_code 前后的格式）：
+      - 科创板：sh.688, sh.689, 或 纯数字 688xxx / 689xxx
+      - 北交所  ：bj.xxx, sh.8xxx, sh.430xxx, sh.92xxxx, 或 纯数字 8xxxx / 430xxx / 92xxxx
+    """
+    if not code:
+        return False
+    c = str(code).lower().strip()
+
+    # —— 带前缀形式 ——
+    if c.startswith('bj.'):
+        return True
+    if c.startswith('sh.688') or c.startswith('sh.689'):
+        return True
+    if c.startswith('sh.8') or c.startswith('sh.430') or c.startswith('sh.92'):
+        return True
+
+    # —— 纯数字形式 ——
+    digits = ''.join(ch for ch in c if ch.isdigit())
+    if len(digits) >= 6:
+        if digits.startswith('688') or digits.startswith('689'):
+            return True
+        if (digits.startswith('8') or digits.startswith('430')
+                or digits.startswith('92')):
+            return True
+    return False
+
+
 def scan_market_intraday(
     strategy_names: Optional[List[str]] = None,
     signal_type: str = 'buy',
@@ -91,7 +121,10 @@ def scan_market_intraday(
         stock_pool = codes
         verbose = True
     else:
-        stock_pool = get_stock_pool_from_db()
+        all_pool = get_stock_pool_from_db()
+        stock_pool = [c for c in all_pool if not _is_restricted(c)]
+        if len(stock_pool) != len(all_pool):
+            logger.info(f"全市场过滤：原 {len(all_pool)} 只，剔除受限板块 {len(all_pool) - len(stock_pool)} 只，剩余 {len(stock_pool)} 只")
         verbose = False
     if not stock_pool:
         logger.error("股票池为空，请先运行 update-stock-list 更新股票列表")
@@ -168,6 +201,7 @@ def scan_market_intraday(
                 today_signals = generate_latest_daily_signal(
                     df, normalized_code, strategy_names, check_volume=check_volume,
                     check_last_row=True,
+                    verbose=verbose,
                 )
             except Exception as e:
                 if verbose:
@@ -177,24 +211,7 @@ def scan_market_intraday(
                 continue
 
             if verbose and not today_signals:
-                # 无信号时也打印关键指标，便于排查
-                from indicators.mytt_indicators import calc_all_indicators
-                df_ind = calc_all_indicators(df)
-                if not df_ind.empty:
-                    last = df_ind.iloc[-1]
-                    vol_ratio = ''
-                    if 'vol_ma5' in df_ind.columns and 'volume' in df_ind.columns and float(last.get('vol_ma5', 0)) > 0:
-                        vr = float(last.get('volume', 0)) / float(last.get('vol_ma5'))
-                        vol_ratio = f"  量比={vr:.2f}"
-                    logger.info(
-                        f"   └─ 收盘={float(last.get('close', 0)):.2f} "
-                        f"DIF={float(last.get('dif', 0)):.4f} "
-                        f"DEA={float(last.get('dea', 0)):.4f} "
-                        f"MACD={float(last.get('macd', 0)):.4f} "
-                        f"K={float(last.get('k', 0)):.2f} "
-                        f"D={float(last.get('d', 0)):.2f} "
-                        f"RSI6={float(last.get('rsi6', 0)):.2f}{vol_ratio}"
-                    )
+                logger.info(f"  └─ 无信号输出（各策略详细诊断信息已打印在上方）")
 
             for sig in today_signals:
                 if signal_type in ('buy', 'all') and sig.signal_type == 1:
@@ -275,12 +292,29 @@ def _scan_market_historical(
     if verbose:
         logger.info(f"【调试模式】打印每只股票的指标数据")
 
+    # 全市场扫描时（非指定代码）剔除科创板/北交所
+    restricted_count = sum(1 for c in stock_pool if _is_restricted(c))
+    if restricted_count > 0:
+        filtered_pool = [c for c in stock_pool if not _is_restricted(c)]
+        logger.info(f"全市场过滤：原 {len(stock_pool)} 只，剔除受限板块 {restricted_count} 只，剩余 {len(filtered_pool)} 只")
+        stock_pool = filtered_pool
+
     name_map = get_stock_name_map()
 
     all_buy_signals = []
     all_sell_signals = []
     total_scanned = 0
     total_with_data = 0
+    # —— 新增：MACD 预测金叉各条件的累计统计（用于调试"信号太少"）——
+    from collections import defaultdict
+    _diag_strategy = None
+    _diag_stats = None
+    _diag_price_filtered = 0
+    _diag_data_short = 0
+    if strategy_names and any('MACD预测金叉' in s for s in strategy_names):
+        from signals.macd_strategy import MACDPredictiveCrossStrategy
+        _diag_strategy = MACDPredictiveCrossStrategy()
+        _diag_stats = defaultdict(lambda: {'total': 0, 'ok': 0})
     start_time = datetime.now()
 
     for code in stock_pool:
@@ -309,6 +343,24 @@ def _scan_market_historical(
 
         total_with_data += 1
 
+        # ---------- 预计算指标（用于 diagnose_last_row 和信号生成，只算一次） ----------
+        df_precalc = None
+        if _diag_stats is not None:
+            try:
+                from indicators.mytt_indicators import calc_all_indicators
+                df_precalc = calc_all_indicators(df.copy())
+                # 诊断：MACD 预测金叉各条件累计统计
+                diag = _diag_strategy.diagnose_last_row(df_precalc)
+                for c in diag.get('conditions', []):
+                    name = c['name']
+                    _diag_stats[name]['total'] += 1
+                    if c.get('ok'):
+                        _diag_stats[name]['ok'] += 1
+            except Exception as e:
+                logger.debug(f"diagnose {normalized_code} 失败: {e}")
+                df_precalc = None
+        # ---------------------------------------------------------
+
         if verbose:
             logger.info(f"[数据] {normalized_code} {stock_name} K线={len(df)} 根 价格={price:.2f}")
 
@@ -316,6 +368,8 @@ def _scan_market_historical(
             signals = generate_latest_daily_signal(
                 df, normalized_code, strategy_names, check_volume=check_volume,
                 check_last_row=True, historical_mode=True,
+                verbose=verbose,
+                _df_precalc=df_precalc,
             )
         except Exception as e:
             if verbose:
@@ -336,23 +390,7 @@ def _scan_market_historical(
                     logger.debug(f"  {normalized_code} 无法获取 {scan_date} 下一交易日开盘价，保留收盘价作为信号价")
 
         if verbose and not signals:
-            from indicators.mytt_indicators import calc_all_indicators
-            df_ind = calc_all_indicators(df)
-            if not df_ind.empty:
-                last = df_ind.iloc[-1]
-                vol_ratio = ''
-                if 'vol_ma5' in df_ind.columns and 'volume' in df_ind.columns and float(last.get('vol_ma5', 0)) > 0:
-                    vr = float(last.get('volume', 0)) / float(last.get('vol_ma5'))
-                    vol_ratio = f"  量比={vr:.2f}"
-                logger.info(
-                    f"   └─ 收盘={float(last.get('close', 0)):.2f} "
-                    f"DIF={float(last.get('dif', 0)):.4f} "
-                    f"DEA={float(last.get('dea', 0)):.4f} "
-                    f"MACD={float(last.get('macd', 0)):.4f} "
-                    f"K={float(last.get('k', 0)):.2f} "
-                    f"D={float(last.get('d', 0)):.2f} "
-                    f"RSI6={float(last.get('rsi6', 0)):.2f}{vol_ratio}"
-                )
+            logger.info(f"  └─ 无信号输出（各策略详细诊断信息已打印在上方）")
 
         for sig in signals:
             if signal_type in ('buy', 'all') and sig.signal_type == 1:
@@ -369,6 +407,20 @@ def _scan_market_historical(
     logger.info(f"[历史扫描 {scan_date}] 完成，总耗时: {total_elapsed:.0f}s")
     logger.info(f"扫描股票: {total_scanned} 只  有效数据: {total_with_data} 只")
     logger.info(f"买入信号: {len(all_buy_signals)} 个  卖出信号: {len(all_sell_signals)} 个")
+
+    # ---------- MACD 预测金叉：打印各条件累计统计 ----------
+    if _diag_stats is not None and total_with_data > 0:
+        logger.info("-" * 60)
+        logger.info(f"【MACD 预测金叉 · 各条件通过率】样本数: {total_with_data}")
+        logger.info(f"  说明：✅ 满足；❌ 不满足。total/ok 分别表示“被统计的股票数/满足该条件的股票数”。")
+        if not _diag_stats:
+            logger.info("  （未统计到任何条件，可能 df 中没有足够的 MACD/MA 指标）")
+        else:
+            for name, v in _diag_stats.items():
+                pct = v['ok'] / v['total'] * 100 if v['total'] else 0
+                bar = '█' * int(pct / 5) + '·' * (20 - int(pct / 5))
+                logger.info(f"  [{'✅' if pct > 50 else '❌'}] {name:<35s}  ok={v['ok']:>5}/total={v['total']:>5} ({pct:>5.1f}%)  {bar}")
+    # -----------------------------------------------------------
 
     if all_buy_signals:
         logger.info("-" * 40)

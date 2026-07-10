@@ -81,19 +81,22 @@ def generate_latest_daily_signal(
     check_volume: bool = True,
     check_last_row: bool = False,
     historical_mode: bool = False,
+    verbose: bool = False,
+    _df_precalc: Optional[pd.DataFrame] = None,
 ) -> List[SignalRecord]:
-    """只计算最新一根K线的信号，性能优化版（用于全市场扫描）
+    """只计算最新一根K线的信号，性能优化版（用于全市场扫描）。
 
-    信号语义：
-        - 总是检查最后一根K线（last_idx）是否形成信号
-        - signal_time = 最后一根K线日期（信号出现的当日）
-        - price = 最后一根K线的 close
-        - 注：历史扫描模式下，调用方会将 price 重写为下一交易日 open，但 signal_time 不变
+    verbose=True 时，会对最后一根K线输出各条件的满足情况（若策略实现了 diagnose_last_row）。
+
+    _df_precalc: 可选，外部已经 calc_all_indicators 处理过的 df。传了就直接用，避免重复计算。
     """
     if df_daily.empty or len(df_daily) < 35:
         return []
 
-    df = calc_all_indicators(df_daily)
+    if _df_precalc is not None and not _df_precalc.empty:
+        df = _df_precalc
+    else:
+        df = calc_all_indicators(df_daily)
     if df.empty or len(df) < 1:
         return []
 
@@ -118,6 +121,15 @@ def generate_latest_daily_signal(
 
             sig = int(signals.iloc[last_idx])
             if sig == 0:
+                if verbose and hasattr(strategy, 'diagnose_last_row'):
+                    diag = strategy.diagnose_last_row(df)
+                    from loguru import logger
+                    lines = diag.get('text', '').splitlines()
+                    status = '全部满足' if diag.get('ok') else '存在不满足'
+                    logger.info(f"  ┌─ {strategy.name} 诊断（{status}）")
+                    for line in lines:
+                        logger.info(f"  │ {line}")
+                    logger.info(f"  └─ 结束")
                 continue
 
             strength = float(strengths.iloc[last_idx])

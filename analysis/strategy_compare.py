@@ -767,6 +767,7 @@ def verify_macd_predictive_signals(
     check_window: int = 1,
     name_map: Optional[Dict[str, str]] = None,
     max_print: int = 500,
+    _batch_mode: bool = False,
 ) -> pd.DataFrame:
     """
     验证「MACD预测金叉」策略的有效性。
@@ -837,6 +838,13 @@ def verify_macd_predictive_signals(
     else:
         code_list = signal_codes
 
+    # 3a. 剔除科创板/北交所（未开户无权限）
+    from scheduler.market_scan import _is_restricted
+    restricted_codes = [c for c in code_list if _is_restricted(c)]
+    if restricted_codes:
+        code_list = [c for c in code_list if not _is_restricted(c)]
+        logger.info(f"剔除受限板块 {len(restricted_codes)} 只，剩余 {len(code_list)} 只股票待验证")
+
     if not code_list:
         logger.info("没有找到符合条件的股票。请先运行:")
         logger.info(f'  python main.py scan-market --strategies "MACD预测金叉" --date {check_date} --save')
@@ -851,6 +859,96 @@ def verify_macd_predictive_signals(
     # 5. 只对有信号的股票拉取K线数据
     code_dfs = get_daily_kline_batch(code_list, start_date=fetch_start)
     logger.info(f"数据加载完成：{len(code_dfs)} 只股票有K线数据")
+
+    # 5a. 如果历史数据无法覆盖 check_date + check_window 个交易日，
+    #     则用新浪实时行情补充一只"今日K线"（用当天收盘/实时价补齐窗口）
+    today_str = _dt.date.today().strftime('%Y-%m-%d')
+    realtime_codes = []
+
+    for code in code_list:
+        df = code_dfs.get(code)
+        if df is None or len(df) < 35:
+            # 历史数据不足 — 即使补了实时也未必能计算指标，但尽力补
+            if df is not None and not df.empty:
+                realtime_codes.append(code)
+            continue
+
+        last_date = str(df['date'].iloc[-1])
+        # 如果最后一个交易日早于今天，说明历史数据还没更新到今天，
+        # 需要拉取实时行情来补齐到今天（如果今天是交易日且有行情）
+        if last_date < today_str:
+            realtime_codes.append(code)
+
+    # 实际判断是否需要补：逐只看窗口是否"已经被历史覆盖"
+    # 只有当窗口内存在无法由历史数据覆盖的交易日时，才需要补充
+    need_realtime = []
+    for code in realtime_codes:
+        df = code_dfs.get(code)
+        if df is None or df.empty:
+            continue
+        # 找信号日索引
+        sig_idx = None
+        for i in range(len(df)):
+            if str(df['date'].iloc[i]) == ref_date_str:
+                sig_idx = i
+                break
+        if sig_idx is None:
+            continue
+        if sig_idx + check_window >= len(df):
+            need_realtime.append(code)
+
+    realtime_quote = None
+    if need_realtime:
+        logger.info(f"{len(need_realtime)} 只股票窗口数据不足，尝试用实时行情补齐...")
+        from data_fetcher.sina_fetcher import get_realtime_quotes
+        try:
+            realtime_quote = get_realtime_quotes(need_realtime)
+        except Exception as e:
+            logger.error(f"拉取实时行情失败: {e}")
+            realtime_quote = None
+
+        if realtime_quote is not None and not realtime_quote.empty:
+            for code in need_realtime:
+                df = code_dfs.get(code)
+                if df is None or df.empty:
+                    continue
+                q = realtime_quote[realtime_quote['code'] == code]
+                if q.empty:
+                    continue
+                q = q.iloc[0]
+                price = float(q.get('price', 0))
+                if price <= 0:
+                    continue
+                last_date = str(df['date'].iloc[-1])
+                preclose = float(df['close'].iloc[-1])
+                # 如果今日交易日与最后一天同日 → 覆盖；否则追加
+                if last_date == today_str:
+                    idx = df.index[-1]
+                    df = df.copy()
+                    df.loc[idx, 'open'] = float(q.get('open', 0)) or float(df.loc[idx, 'open'])
+                    df.loc[idx, 'high'] = float(q.get('high', 0)) or float(df.loc[idx, 'high'])
+                    df.loc[idx, 'low'] = float(q.get('low', 0)) or float(df.loc[idx, 'low'])
+                    df.loc[idx, 'close'] = price
+                    df.loc[idx, 'volume'] = int(q.get('volume', 0)) or int(df.loc[idx, 'volume'])
+                    df.loc[idx, 'amount'] = float(q.get('amount', 0)) or float(df.loc[idx, 'amount'])
+                else:
+                    pct = ((price - preclose) / preclose * 100.0) if preclose > 0 else 0.0
+                    new_row = {
+                        'date': today_str,
+                        'code': code,
+                        'open': float(q.get('open', 0)),
+                        'high': float(q.get('high', 0)),
+                        'low': float(q.get('low', 0)),
+                        'close': price,
+                        'volume': int(q.get('volume', 0)),
+                        'amount': float(q.get('amount', 0)),
+                        'pct_chg': pct,
+                        'turnover': 0.0,
+                    }
+                    df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+                code_dfs[code] = df
+            logger.info(f"实时行情补齐完成，共更新 {len(need_realtime)} 只股票")
+
 
     detail_rows = []
     skipped = 0
@@ -882,15 +980,24 @@ def verify_macd_predictive_signals(
         dif_i = float(df_ind['dif'].values[signal_idx])
         dea_i = float(df_ind['dea'].values[signal_idx])
 
-        # —— 向后检查金叉 / MACD柱增大 / 窗口日收益率 ——
+        # —— 向后检查金叉 / MACD柱增大 / 窗口日收益率 / 窗口内最高收益 ——
         macd_increase_next = False
         next_macd_val = float('nan')
         cross_day = None
         cross_date = None
-        # ret_per_day[k] = 到第 k 个交易日收盘价相对信号日的收益率 (k = 1..check_window)
+        # ret_per_day[k] = 第 k 个交易日收盘价相对信号日的收益率 (k = 1..check_window)
         ret_per_day = {k: float('nan') for k in range(1, check_window + 1)}
+        # 窗口内最高收益（用 high 计算，代表能吃到的最大涨幅）
+        max_high_pct = float('nan')
+        max_high_day = None
+        # 窗口内最大收盘价收益（比 high 更保守，但不会误把集合竞价/尾盘冲高算入）
+        max_close_pct = float('nan')
+        max_close_day = None
 
         n = len(df_ind)
+        high_arr = df_ind['high'].values
+        close_arr = df_ind['close'].values
+
         for k in range(1, check_window + 1):
             j = signal_idx + k
             if j >= n:
@@ -899,7 +1006,7 @@ def verify_macd_predictive_signals(
             macd_j = float(df_ind['macd'].values[j])
             dif_j = float(df_ind['dif'].values[j])
             dea_j = float(df_ind['dea'].values[j])
-            close_j = float(df_ind['close'].iloc[j])
+            close_j = float(close_arr[j])
 
             if k == 1:
                 next_macd_val = macd_j
@@ -914,8 +1021,23 @@ def verify_macd_predictive_signals(
                     cross_day = k
                     cross_date = str(df_ind['date'].iloc[j])
 
-            # 窗口内每个交易日的收益率
+            # 窗口内每个交易日的收盘价收益率（保留原逻辑）
             ret_per_day[k] = (close_j - close_i) / close_i * 100.0
+
+            # —— 只有 k >= 2 才统计「最高收益」：信号日买入后，最早 T+1 日才能卖出
+            if k >= 2:
+                if j < len(high_arr):
+                    high_j = float(high_arr[j])
+                    high_ret = (high_j - close_i) / close_i * 100.0
+                    if pd.isna(max_high_pct) or high_ret > max_high_pct:
+                        max_high_pct = high_ret
+                        max_high_day = k
+
+                close_ret = ret_per_day[k]
+                if not pd.isna(close_ret):
+                    if pd.isna(max_close_pct) or close_ret > max_close_pct:
+                        max_close_pct = close_ret
+                        max_close_day = k
 
         info = signal_info.get(code, {})
         name = nm.get(code, '')
@@ -935,6 +1057,10 @@ def verify_macd_predictive_signals(
             'cross_within_window': '✓' if cross_day is not None else '✗',
             'cross_day': cross_day if cross_day is not None else '',
             'cross_date': cross_date or '',
+            'max_high_pct': round(max_high_pct, 2),
+            'max_high_day': max_high_day if max_high_day is not None else '',
+            'max_close_pct': round(max_close_pct, 2),
+            'max_close_day': max_close_day if max_close_day is not None else '',
         }
         for k in range(1, check_window + 1):
             row_dict[f'ret_{k}d_pct'] = round(ret_per_day[k], 2)
@@ -997,11 +1123,47 @@ def verify_macd_predictive_signals(
         prefix = '  ├─' if idx < len(day_stats) - 1 else '  └─'
         logger.info(f"{prefix} 第{k}日收盘平均涨幅: {avg:.2f}% · 上涨概率: "
                     f"{win / cnt * 100:.1f}% ({win}/{cnt})")
+
+    # 窗口内「最高收益」汇总（high / close），
+    # 注意：仅统计 k>=2 的交易日（信号日买入，T+1 才能卖）
+    try:
+        high_valid = result_df[result_df['max_high_pct'].notna()]
+        close_valid = result_df[result_df['max_close_pct'].notna()]
+
+        if not high_valid.empty:
+            avg_high = high_valid['max_high_pct'].mean()
+            med_high = high_valid['max_high_pct'].median()
+            win_high = sum(1 for r in high_valid['max_high_pct'] if r > 0)
+            pct3 = sum(1 for r in high_valid['max_high_pct'] if r >= 3.0)
+            pct5 = sum(1 for r in high_valid['max_high_pct'] if r >= 5.0)
+            logger.info(f"  ┌─ 窗口内最高收益(high, k≥2): 平均={avg_high:.2f}%  中位数={med_high:.2f}%  "
+                        f">0%:{win_high}/{len(high_valid)}({win_high / len(high_valid) * 100:.1f}%)  "
+                        f">=3%:{pct3}/{len(high_valid)}({pct3 / len(high_valid) * 100:.1f}%)  "
+                        f">=5%:{pct5}/{len(high_valid)}({pct5 / len(high_valid) * 100:.1f}%)")
+
+        if not close_valid.empty:
+            avg_close = close_valid['max_close_pct'].mean()
+            med_close = close_valid['max_close_pct'].median()
+            win_close = sum(1 for r in close_valid['max_close_pct'] if r > 0)
+            pct3_c = sum(1 for r in close_valid['max_close_pct'] if r >= 3.0)
+            pct5_c = sum(1 for r in close_valid['max_close_pct'] if r >= 5.0)
+            logger.info(f"  └─ 窗口内最高收益(close, k≥2): 平均={avg_close:.2f}%  中位数={med_close:.2f}%  "
+                        f">0%:{win_close}/{len(close_valid)}({win_close / len(close_valid) * 100:.1f}%)  "
+                        f">=3%:{pct3_c}/{len(close_valid)}({pct3_c / len(close_valid) * 100:.1f}%)  "
+                        f">=5%:{pct5_c}/{len(close_valid)}({pct5_c / len(close_valid) * 100:.1f}%)")
+    except Exception as _e:
+        logger.debug(f"计算窗口内最高收益时发生异常: {_e}")
+
     if skipped > 0:
         logger.info(f"  (跳过 {skipped} 只无K线数据 / 信号日无数据的股票)")
     logger.info("-" * 70)
 
     # —— 按各参数阈值分层统计，帮助判断是否需要调整 ——
+    #  batch 模式下跳过明细/分段统计，避免范围模式时输出过多
+    if _batch_mode:
+        # batch 模式下只返回 DataFrame 和基本汇总 logger 信息，不打印明细表
+        return result_df
+
     # 使用最后一个窗口日作为"盈亏"基准
     metric_col = f'ret_{check_window}d_pct'
     has_metric = result_df[result_df[metric_col].notna()]
@@ -1095,51 +1257,72 @@ def verify_macd_predictive_signals(
         title = (f"「MACD预测金叉」信号验证明细 · 共 {total_signals} 条 · "
                  f"显示前 {min(max_print, total_signals)} 条")
         table = Table(title=title, show_lines=False)
-        table.add_column("#", justify="center", style="cyan")
+        table.add_column("#", justify="center", style="cyan", max_width=5)
         table.add_column("代码", style="magenta")
-        table.add_column("名称")
         table.add_column("信号日", justify="center")
-        table.add_column("信号日MACD", justify="right")
-        table.add_column("次日MACD", justify="right")
-        table.add_column("次日柱增大", justify="center")
+        # 合并信号日MACD + 次日 + 是否增大为一列，让宽表格可读
+        table.add_column("MACD(信号/次日)", justify="right")
+        # 合并 "N日内是否有金叉 / 金叉日" 成一列
         table.add_column(f"{check_window}日内金叉", justify="center")
-        table.add_column("金叉日", justify="center")
+        # 窗口最高收益，同时用括号标出出现日，不再单列
+        table.add_column("最高(high,k≥2)", justify="right", style="bold yellow")
+        table.add_column("最高(close,k≥2)", justify="right", style="bold green")
         for k in range(1, check_window + 1):
             style = "bold green" if k == 1 else ""
             table.add_column(f"{k}日%", justify="right", style=style)
 
         for idx, row in result_df.head(max_print).iterrows():
+            macd_signal = row['macd_at_signal']
+            macd_next = row['next_day_macd']
+            # 用简短符号表达「柱增大/减小」
+            dir_sym = "↑" if row['macd_increase_next'] in ('✓', 'Y', 'y', 1, True) else "↓"
+            macd_col = f"{macd_signal:.4f}→{macd_next:.4f}({dir_sym})"
+
+            cross_col = (str(row['cross_date']) if row['cross_date'] else '—')
+            if row.get('cross_within_window') in ('✓', 'Y', 'y', 1, True):
+                cross_col = f"✓ {cross_col}"
+            else:
+                cross_col = f"✗ {cross_col}" if row['cross_date'] else '✗'
+
+            high_pct = row['max_high_pct'] if not pd.isna(row['max_high_pct']) else None
+            high_day = row.get('max_high_day')
+            high_col = f"{high_pct:.2f}% @{high_day}" if high_pct is not None else '—'
+
+            close_pct = row['max_close_pct'] if not pd.isna(row['max_close_pct']) else None
+            close_day = row.get('max_close_day')
+            close_col = f"{close_pct:.2f}% @{close_day}" if close_pct is not None else '—'
+
             cells = [
                 str(idx + 1),
                 row['code'],
-                str(row['name']),
                 row['signal_date'],
-                f"{row['macd_at_signal']:.4f}",
-                f"{row['next_day_macd']:.4f}",
-                row['macd_increase_next'],
-                row['cross_within_window'],
-                row['cross_date'] if row['cross_date'] else '—',
+                macd_col,
+                cross_col,
+                high_col,
+                close_col,
             ]
             for k in range(1, check_window + 1):
-                col = f'ret_{k}d_pct'
-                val = row[col]
-                cells.append(f"{val:.2f}")
+                cells.append(f"{row[f'ret_{k}d_pct']:.2f}")
             table.add_row(*cells)
         console.print(table)
         if len(result_df) > max_print:
             logger.info(f"  表格只显示前 {max_print} 条，其余 {len(result_df) - max_print} 条省略")
     except Exception:
         for idx, row in result_df.head(max_print).iterrows():
+            high_pct = row['max_high_pct'] if not pd.isna(row['max_high_pct']) else None
+            high_day = row.get('max_high_day')
+            close_pct = row['max_close_pct'] if not pd.isna(row['max_close_pct']) else None
+            close_day = row.get('max_close_day')
+            high_parts = f"最高(high)={high_pct:.2f}%@第{high_day}天" if high_pct is not None else "最高(high)=—"
+            close_parts = f"最高(close)={close_pct:.2f}%@第{close_day}天" if close_pct is not None else "最高(close)=—"
             ret_parts = " ".join(
-                f"{k}日={row[f'ret_{k}d_pct']:.2f}%" for k in range(1, check_window + 1)
+                f"{k}d={row[f'ret_{k}d_pct']:.2f}%" for k in range(1, check_window + 1)
             )
             logger.info(
-                f"  {idx + 1:>3}. {row['code']} {row['name']} "
-                f"信号:{row['signal_date']}[MACD={row['macd_at_signal']:.4f}] "
-                f"次日MACD={row['next_day_macd']:.4f} "
-                f"柱增大={row['macd_increase_next']} "
-                f"{check_window}日内金叉={row['cross_within_window']} "
-                f"({row['cross_date'] or '—'}) {ret_parts}"
+                f"  {idx + 1:>3}. {row['code']} 信号:{row['signal_date']} "
+                f"MACD={row['macd_at_signal']:.4f}→{row['next_day_macd']:.4f} "
+                f"金叉={row['cross_within_window']}({row['cross_date'] or '—'}) "
+                f"{high_parts} {close_parts} {ret_parts}"
             )
 
     logger.info("-" * 70)
@@ -1152,7 +1335,8 @@ def verify_macd_predictive_signals(
                 'strength', 'reason', 'macd_at_signal',
                 'dif_at_signal', 'dea_at_signal', 'next_day_macd',
                 'macd_increase_next',
-                'cross_within_window', 'cross_day', 'cross_date']
+                'cross_within_window', 'cross_day', 'cross_date',
+                'max_high_pct', 'max_high_day', 'max_close_pct', 'max_close_day']
         for k in range(1, check_window + 1):
             cols.append(f'ret_{k}d_pct')
         result_df[cols].to_csv(csv_path, index=False, encoding='utf-8-sig')

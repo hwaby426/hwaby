@@ -73,6 +73,42 @@ class BaseStrategy(ABC):
                 snap['volume_ratio'] = round(snap['volume'] / snap['vol_ma5'], 3)
         return snap
 
+    def diagnose_last_row(self, df: pd.DataFrame) -> Dict[str, Any]:
+        """
+        调试辅助：分析最后一根K线未触发信号的原因。
+
+        返回:
+        {
+            'ok': bool,   # 是否所有条件均满足
+            'conditions': [{'name': str, 'ok': bool, 'detail': str}, ...],
+            'text': str,  # 人类可读总结
+        }
+
+        子类应覆盖以给出更精确的每个条件判断。
+        """
+        n = len(df)
+        if n < 35:
+            return {
+                'ok': False,
+                'conditions': [{'name': 'K线数量', 'ok': False, 'detail': f'共 {n} 根，需要 >= 35'}],
+                'text': f'K线数量不足 ({n} < 35)',
+            }
+        # 通用回退：只返回最后一日是否满足 generate_signals == 1
+        signals = self.generate_signals(df)
+        last_sig = int(signals.iloc[-1]) if not signals.empty else 0
+        ok = last_sig != 0
+        row = df.iloc[-1]
+        snap = self.get_indicator_snapshot(df, n - 1)
+        parts = []
+        for k, v in snap.items():
+            if k in ('close', 'dif', 'dea', 'macd', 'volume', 'vol_ma20'):
+                parts.append(f"{k}={v}")
+        return {
+            'ok': ok,
+            'conditions': [{'name': '信号', 'ok': ok, 'detail': '最后一日信号=' + ('是' if ok else '否')}],
+            'text': " | ".join(parts),
+        }
+
     def generate_signal_records(
         self,
         df: pd.DataFrame,

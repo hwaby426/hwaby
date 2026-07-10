@@ -153,16 +153,89 @@ def realtime():
 @click.option('--min-price', default=2.0, type=float, help='最低价格过滤')
 @click.option('--max-price', default=200.0, type=float, help='最高价格过滤')
 @click.option('--no-save', is_flag=True, default=False, help='不保存到数据库，只打印')
-@click.option('--date', 'scan_date', default=None, help='指定扫描日期 YYYY-MM-DD，不指定则为盘中实时扫描')
+@click.option('--date', 'scan_date', default=None, help='（单日期）指定扫描日期 YYYY-MM-DD，不指定则为盘中实时扫描')
+@click.option('--start', 'start_date', default=None, help='（批量）起始日期 YYYY-MM-DD，配合 --end 批量扫描区间内的每个交易日')
+@click.option('--end', 'end_date', default=None, help='（批量）结束日期 YYYY-MM-DD')
 @click.option('--codes', default=None, help='指定股票代码，逗号分隔，如 --codes sh.600519,sz.000001。不指定则扫描全市场')
 @click.option('--no-volume', is_flag=True, default=False, help='关闭 MACD金叉策略的成交量过滤（默认开启）')
-def scan_market(strategies, signal_type, min_price, max_price, no_save, scan_date, codes, no_volume):
-    """全市场日线信号扫描 —— 盘中扫描或扫描指定日期(支持周末/节假日)"""
+def scan_market(strategies, signal_type, min_price, max_price, no_save, scan_date, start_date, end_date, codes, no_volume):
+    """全市场日线信号扫描 —— 盘中扫描 / 指定单日期扫描 / 批量扫描区间内每个交易日
+
+    用法：
+      1) 盘中实时扫描：
+           python main.py scan-market --strategies MACD预测金叉
+      2) 单日期历史扫描：
+           python main.py scan-market --strategies MACD预测金叉 --date 2026-07-07
+      3) 批量扫描两个日期中每一天的预测（自动跳过非交易日）：
+           python main.py scan-market --strategies MACD预测金叉 --start 2026-07-01 --end 2026-07-07
+    """
     from scheduler.market_scan import scan_market_intraday
 
     strategy_list = strategies.split(',') if strategies else None
     code_list = [c.strip() for c in codes.split(',') if c.strip()] if codes else None
 
+    # 批量模式：start + end 都传，自动枚举交易日并每天扫一次
+    if start_date and end_date:
+        from datetime import datetime, timedelta
+        try:
+            start_dt = datetime.strptime(start_date, '%Y-%m-%d').date()
+            end_dt = datetime.strptime(end_date, '%Y-%m-%d').date()
+        except ValueError:
+            logger.error(f"日期格式错误: {start_date}/{end_date}，请使用 YYYY-MM-DD")
+            return
+
+        if start_dt > end_dt:
+            logger.error(f"起始日期 {start_date} 晚于结束日期 {end_date}")
+            return
+
+        dates = []
+        cur = start_dt
+        while cur <= end_dt:
+            # 只保留周一到周五（非周末）。更严格可以用实际交易日历，但这里够用
+            if cur.weekday() < 5:
+                dates.append(cur.strftime('%Y-%m-%d'))
+            cur += timedelta(days=1)
+
+        if not dates:
+            logger.warning(f"区间 {start_date} ~ {end_date} 没有有效的周一到周五")
+            return
+
+        logger.info(f"=== 批量扫描 {len(dates)} 个交易日：{dates[0]} ~ {dates[-1]} ===")
+
+        daily_summary = []
+        total_signals = 0
+        for i, d in enumerate(dates, 1):
+            logger.info(f"—— [{i}/{len(dates)}] 扫描 {d} ——")
+            signals = scan_market_intraday(
+                strategy_names=strategy_list,
+                signal_type=signal_type,
+                min_price=min_price,
+                max_price=max_price,
+                save=not no_save,
+                scan_date=d,
+                codes=code_list,
+                check_volume=not no_volume,
+            )
+            n_signals = len(signals) if isinstance(signals, list) else 0
+            # signal_type: 1=buy, -1=sell
+            n_buy = sum(1 for s in signals if (isinstance(s, dict) and s.get('signal_type') == 1)
+                        or (hasattr(s, 'signal_type') and getattr(s, 'signal_type') == 1)) if isinstance(signals, list) else 0
+            n_sell = n_signals - n_buy
+            daily_summary.append((d, n_buy, n_sell))
+            total_signals += n_signals
+
+        # 汇总表
+        logger.info("=" * 70)
+        logger.info(f"【批量扫描汇总】{dates[0]} ~ {dates[-1]}，共 {len(dates)} 个交易日，总信号 {total_signals} 个")
+        # 用表头 + 每日一行，对齐输出
+        header = f"  {'日期':>12}  | {'买入':>6}  | {'卖出':>6}"
+        logger.info(header)
+        logger.info(f"  {'-'*12}  | {'-'*6}  | {'-'*6}")
+        for d, n_buy, n_sell in daily_summary:
+            logger.info(f"  {d:>12}  | {n_buy:>6}  | {n_sell:>6}")
+        return
+
+    # 单日期模式 / 盘中模式（原逻辑）
     if scan_date:
         from datetime import datetime
         try:
@@ -415,7 +488,8 @@ def strategies():
 @click.option('--period', default='daily', help='K线周期: daily/5min/15min')
 @click.option('--sort-by', default='total_return', help='排序指标: total_return/annual_return/sharpe_ratio/win_rate/profit_factor')
 @click.option('--t0', is_flag=True, default=False, help='T+0模式：当天买入当天可卖出')
-def compare(code, strategies, start, end, capital, period, sort_by, t0):
+@click.option('--no-volume', is_flag=True, default=False, help='关闭 MACD金叉 策略的成交量过滤（默认开启，要求成交量 >= 1.25 x 5日均量）')
+def compare(code, strategies, start, end, capital, period, sort_by, t0, no_volume):
     """单只股票/多只股票 多策略对比回测"""
     from datetime import datetime, timedelta
     from data_fetcher.baostock_fetcher import normalize_code, get_daily_kline_df, get_daily_kline_batch
@@ -454,7 +528,8 @@ def compare(code, strategies, start, end, capital, period, sort_by, t0):
 
         result = run_strategy_compare(df, c, strategy_names=strategy_list,
                                       initial_capital=capital, period=period, t0=t0,
-                                      trade_start_date=start)
+                                      trade_start_date=start,
+                                      check_volume=not no_volume)
         print_compare_table(result, sort_by=sort_by)
         logger.info("")
 
@@ -657,21 +732,235 @@ def macd_intraday_pnl_from_db(start, end, codes):
 
 
 @cli.command('verify-macd-prediction')
-@click.option('--start', 'check_date', required=True, help='信号检查日期 YYYY-MM-DD（即 scan-market --date 的日期）')
+@click.option('--start', 'start_date', required=True, help='信号检查起始日期 YYYY-MM-DD（即 scan-market --date 的日期）')
+@click.option('--end', 'end_date', default=None, help='（可选）信号检查结束日期 YYYY-MM-DD，不传则只检查 start 单日')
 @click.option('--codes', default=None, help='股票代码列表，逗号分隔。不传则验证所有在该日有信号的股票')
-@click.option('--window', 'check_window', default=1, type=int, help='向后检查多少个交易日内是否出现金叉，默认 1')
-@click.option('--max-print', default=500, type=int, help='明细最多打印多少行，默认 500')
-def verify_macd_prediction(check_date, codes, check_window, max_print):
-    """验证 MACD 预测金叉信号：从 trade_signals 读取指定日期信号，检查后续 N 天是否出现真正金叉"""
+@click.option('--window', 'check_window', default=5, type=int, help='向后检查多少个交易日内是否出现金叉/最高收益，默认 5')
+@click.option('--max-print', default=500, type=int, help='单日明细最多打印多少行，默认 500')
+def verify_macd_prediction(start_date, end_date, codes, check_window, max_print):
+    """验证 MACD 预测金叉信号：从 trade_signals 读取指定日期信号，检查后续 N 天是否出现真正金叉，
+    并统计窗口内最高价/最高收盘价收益出现的位置。"""
+    from datetime import datetime, timedelta
     from data_fetcher.stock_pool import get_stock_name_map
     from analysis.strategy_compare import verify_macd_predictive_signals
 
     code_list = [c.strip() for c in codes.split(',') if c.strip()] if codes else None
     name_map = get_stock_name_map()
 
+    # 枚举日期范围：只保留工作日（周一至周五）
+    start_dt = datetime.strptime(start_date, '%Y-%m-%d').date()
+    if end_date:
+        end_dt = datetime.strptime(end_date, '%Y-%m-%d').date()
+    else:
+        end_dt = start_dt
+
+    if end_dt < start_dt:
+        logger.error(f"起始日期 {start_date} 晚于结束日期 {end_date}")
+        return
+
+    dates = []
+    cur = start_dt
+    while cur <= end_dt:
+        if cur.weekday() < 5:
+            dates.append(cur.strftime('%Y-%m-%d'))
+        cur += timedelta(days=1)
+
+    if not dates:
+        logger.warning(f"区间 {start_date} ~ {end_date} 没有有效的周一到周五")
+        return
+
+    # 多日范围：逐天跑一次，同时汇总「第几天收益最高」&「每日平均收益」
+    if len(dates) > 1:
+        logger.info("=" * 70)
+        logger.info(f"批量验证 MACD 预测金叉：{dates[0]} ~ {dates[-1]} 共 {len(dates)} 个交易日 (window={check_window})")
+        logger.info("=" * 70)
+
+        # 用于整体汇总
+        total_high_day_counts = {k: 0 for k in range(1, check_window + 1)}
+        total_close_day_counts = {k: 0 for k in range(1, check_window + 1)}
+        total_daily_ret = {k: [] for k in range(1, check_window + 1)}
+        daily_summary = []
+        total_signals = 0
+
+        # 用 rich 表格打印每日期的窗口内收益汇总（每个日期一行）
+        from rich.console import Console as _Console
+        from rich.table import Table as _Table
+        _console = _Console()
+
+        for d in dates:
+            logger.info(f"—— 验证 {d} ——")
+            df = verify_macd_predictive_signals(
+                codes=code_list,
+                check_date=d,
+                check_window=check_window,
+                name_map=name_map,
+                max_print=max_print,
+                # 在范围模式下让单日内的打印更安静
+                _batch_mode=True,
+            )
+            if df is None or df.empty:
+                # 空日期仍然记录，避免表格行数错
+                row_map = {
+                    'date': d, 'signals': 0, 'avg_high': float('nan'),
+                    'avg_close': float('nan'),
+                }
+                for k in range(1, check_window + 1):
+                    row_map[f'day{k}'] = float('nan')
+                    row_map[f'high_day{k}_cnt'] = 0
+                    row_map[f'close_day{k}_cnt'] = 0
+                daily_summary.append(row_map)
+                continue
+
+            valid_high = df[df['max_high_day'].notna() & (df['max_high_day'] != '')]
+            valid_close = df[df['max_close_day'].notna() & (df['max_close_day'] != '')]
+
+            # 统计 "第几天收益最高" 的分布（用 k≥2 的版本，实际上窗口里 max_high_day >=2，
+            # 若 window=1 可能为空）
+            high_day_cnt = {k: 0 for k in range(1, check_window + 1)}
+            close_day_cnt = {k: 0 for k in range(1, check_window + 1)}
+            for _, r in valid_high.iterrows():
+                try:
+                    k = int(r['max_high_day'])
+                    if 1 <= k <= check_window:
+                        total_high_day_counts[k] += 1
+                        high_day_cnt[k] += 1
+                except Exception:
+                    pass
+            for _, r in valid_close.iterrows():
+                try:
+                    k = int(r['max_close_day'])
+                    if 1 <= k <= check_window:
+                        total_close_day_counts[k] += 1
+                        close_day_cnt[k] += 1
+                except Exception:
+                    pass
+
+            # 每日平均收益（用收盘价）
+            day_close_avg = {}
+            for k in range(1, check_window + 1):
+                col = f'ret_{k}d_pct'
+                vals = df[col].dropna()
+                if not vals.empty:
+                    total_daily_ret[k].extend(vals.tolist())
+                    day_close_avg[k] = vals.mean()
+                else:
+                    day_close_avg[k] = float('nan')
+
+            day_total = len(df)
+            day_avg_high = valid_high['max_high_pct'].mean() if not valid_high.empty else float('nan')
+            day_avg_close = valid_close['max_close_pct'].mean() if not valid_close.empty else float('nan')
+
+            # 当天最高收益出现最频繁的 day
+            def _top_day(cnt_dict):
+                best_k, best_c = None, 0
+                for kk, cc in cnt_dict.items():
+                    if cc > best_c:
+                        best_k, best_c = kk, cc
+                return best_k
+
+            row_map = {
+                'date': d, 'signals': day_total,
+                'avg_high': day_avg_high, 'avg_close': day_avg_close,
+                'top_high_day': _top_day(high_day_cnt),
+                'top_close_day': _top_day(close_day_cnt),
+            }
+            for k in range(1, check_window + 1):
+                row_map[f'day{k}'] = day_close_avg[k]
+                row_map[f'high_day{k}_cnt'] = high_day_cnt[k]
+                row_map[f'close_day{k}_cnt'] = close_day_cnt[k]
+            daily_summary.append(row_map)
+            total_signals += day_total
+
+        # —— 打印整体汇总 ——
+        logger.info("=" * 70)
+        logger.info(f"【范围验证汇总】{dates[0]} ~ {dates[-1]} 共 {len(dates)} 个交易日，累计信号 {total_signals} 条")
+
+        # 表格 1：每日信号数 + 每日收盘平均收益（1..window 日） + 窗口内最高收益平均
+        title1 = (f"每日明细 · 信号数 & 每日收盘平均收益（相对信号日）& 窗口内最高收益平均 "
+                  f"(k≥2)")
+        table1 = _Table(title=title1, show_lines=False)
+        table1.add_column("日期", justify="center", style="cyan")
+        table1.add_column("信号数", justify="right")
+        for k in range(1, check_window + 1):
+            table1.add_column(f"{k}日%", justify="right")
+        table1.add_column("最高(high)", justify="right", style="bold yellow")
+        table1.add_column("最高(close)", justify="right", style="bold green")
+        for row in daily_summary:
+            cells = [row['date'], str(row['signals'])]
+            for k in range(1, check_window + 1):
+                v = row[f'day{k}']
+                cells.append(f"{v:.2f}" if v == v else "—")  # NaN == NaN is False
+            ah = row['avg_high']
+            ac = row['avg_close']
+            cells.append(f"{ah:.2f}%" if ah == ah else "—")
+            cells.append(f"{ac:.2f}%" if ac == ac else "—")
+            table1.add_row(*cells)
+        _console.print(table1)
+
+        # 表格 2：每日最高收益出现在第几天的分布（每日期一行，展示 high/close 各 day 的样本数）
+        title2 = f"每日最高收益出现位置分布（仅 k≥2，high / close 各 day 样本数）"
+        table2 = _Table(title=title2, show_lines=False)
+        table2.add_column("日期", justify="center", style="cyan")
+        table2.add_column("信号数", justify="right")
+        for k in range(2, check_window + 1):
+            table2.add_column(f"H-{k}日", justify="right")
+        for k in range(2, check_window + 1):
+            table2.add_column(f"C-{k}日", justify="right")
+        table2.add_column("high最常", justify="center", style="bold yellow")
+        table2.add_column("close最常", justify="center", style="bold green")
+        for row in daily_summary:
+            cells = [row['date'], str(row['signals'])]
+            for k in range(2, check_window + 1):
+                cells.append(str(row[f'high_day{k}_cnt']))
+            for k in range(2, check_window + 1):
+                cells.append(str(row[f'close_day{k}_cnt']))
+            cells.append(f"第{row['top_high_day']}天" if row.get('top_high_day') else "—")
+            cells.append(f"第{row['top_close_day']}天" if row.get('top_close_day') else "—")
+            table2.add_row(*cells)
+        _console.print(table2)
+
+        # 第几天收益最高分布（整体汇总）
+        logger.info("—— 汇总：窗口内最高收益出现在第几天（仅统计 k≥2 的卖出日）——")
+        def _print_distribution(title, counts):
+            total_c = sum(counts.values())
+            if total_c == 0:
+                logger.info(f"  {title}: 无可用数据")
+                return
+            # 找出现最多的 day
+            most_day = max(counts, key=lambda k: counts[k])
+            logger.info(f"  {title}: 共 {total_c} 条，最常出现在第 {most_day} 天 "
+                        f"(占比 {counts[most_day] / total_c * 100:.1f}%)")
+            # 柱状表示
+            parts = []
+            for k in range(2, check_window + 1):
+                c = counts.get(k, 0)
+                pct = c / total_c * 100
+                bar = '█' * int(pct / 2)
+                parts.append(f"第{k}天={c}({pct:.1f}%){bar}")
+            logger.info("    " + "  ".join(parts))
+
+        _print_distribution("最高(high)", total_high_day_counts)
+        _print_distribution("最高(close)", total_close_day_counts)
+
+        # 每日平均收盘收益走势（整体）
+        logger.info("—— 汇总：每日收盘平均收益（相对信号日）——")
+        avg_line_parts = []
+        for k in range(1, check_window + 1):
+            vals = total_daily_ret[k]
+            if vals:
+                avg = sum(vals) / len(vals)
+                avg_line_parts.append(f"{k}日={avg:.2f}% (n={len(vals)})")
+            else:
+                avg_line_parts.append(f"{k}日=—")
+        logger.info("  " + "  |  ".join(avg_line_parts))
+
+        logger.info("=" * 70)
+        return
+
+    # 单日模式：原逻辑
     verify_macd_predictive_signals(
         codes=code_list,
-        check_date=check_date,
+        check_date=start_date,
         check_window=check_window,
         name_map=name_map,
         max_print=max_print,

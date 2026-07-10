@@ -184,15 +184,16 @@ class MACDCrossStrategy(BaseStrategy):
 class MACDPredictiveCrossStrategy(BaseStrategy):
     """MACD预测金叉策略（底部预判型）
 
-    买入条件（全部满足）：
-      1. MACD柱 < 0              → 当前仍处于绿柱区（DIF < DEA）
-      2. MACD柱连续3天增大        → MACD[i] > MACD[i-1] > MACD[i-2] > MACD[i-3]
-      3. DIF拐头向上              → DIF[i] > DIF[i-1] 且 DIF[i-1] <= DIF[i-2]
-      4. 当日成交量 > 20日均量     → volume[i] > vol_ma20[i]
+    买入触发条件（全部满足，缺一不可）：
+      1. 位置确认：MACD 柱 < 0（处于绿柱区，满足左侧预判）
+      2. 加速确认：从前天 (i-2) 到今天，MACD 柱回升 ≥ 30%（仅看两天跨度的收窄幅度，不要求连续增大）
+      3. 方向确认：DIF[i] > DIF[i-1] 且 DIF[i-1] <= DIF[i-2]（DIF 拐头向上）
+      4. 趋势过滤：收盘价 > MA10 / MA20 中任意一条（站上 10 日或 20 日均线，避免下跌中继）
+      5. 资金确认：收阳线 且 成交量 > 5日均量 * 1.1（真金白银温和放量）
     """
 
     name = "MACD预测金叉"
-    description = "MACD绿柱区连续2日收敛30%+ + DIF向上 + 放量 + 明日涨幅<5%即可金叉"
+    description = "MACD绿柱加速收缩 + DIF拐头 + 股价站上MA20 + 放量阳线"
 
     def generate_signals(self, df: pd.DataFrame) -> pd.Series:
         signals = pd.Series(np.zeros(len(df)), index=df.index, dtype=int)
@@ -203,60 +204,90 @@ class MACDPredictiveCrossStrategy(BaseStrategy):
         dea = df['dea'].values.astype(float)
         macd_col = df['macd'].values.astype(float)
         close = df['close'].values.astype(float)
-        ema12 = df['ema12'].values.astype(float) if 'ema12' in df.columns else None
-        ema26 = df['ema26'].values.astype(float) if 'ema26' in df.columns else None
+        high = df['high'].values.astype(float) if 'high' in df.columns else None
+        low = df['low'].values.astype(float) if 'low' in df.columns else None
+        ma20 = df['ma20'].values.astype(float) if 'ma20' in df.columns else None
 
         vol = None
-        vol_ma20 = None
-        if 'volume' in df.columns and 'vol_ma20' in df.columns:
+        vol_ma5 = None
+        if 'volume' in df.columns and 'vol_ma5' in df.columns:
             vol = df['volume'].values.astype(float)
-            vol_ma20 = df['vol_ma20'].values.astype(float)
+            vol_ma5 = df['vol_ma5'].values.astype(float)
 
-        alpha12 = 2.0 / 13.0
-        alpha26 = 2.0 / 27.0
-        dif_alpha = alpha12 - alpha26  # ≈ 0.0798
+        # 预计算"近6个交易日内是否存在涨停（涨幅>=9.5%）"
+        limit_up = None
+        if len(df) > 1 and 'close' in df.columns:
+            prev_close = np.roll(close, 1)
+            prev_close[0] = np.nan
+            with np.errstate(invalid='ignore', divide='ignore'):
+                daily_pct = np.where(
+                    (prev_close > 0) & (~np.isnan(prev_close)) & (~np.isnan(close)),
+                    (close - prev_close) / prev_close * 100.0,
+                    0.0,
+                )
+            limit_up_window = np.zeros(len(df), dtype=bool)
+            for i in range(len(df)):
+                start = max(0, i - 5)
+                window_max = np.nanmax(daily_pct[start:i + 1])
+                if not np.isnan(window_max) and window_max >= 9.5:
+                    limit_up_window[i] = True
+            limit_up = limit_up_window
 
         n = len(df)
-        for i in range(3, n):  # 至少需要 i-3
-            # 条件 1：MACD 柱 < 0（仍在绿柱区，未金叉）
+        for i in range(3, n):
+            # 过滤 1：股价 < 5 元的低价股不参与预测金叉
+            if np.isnan(close[i]) or close[i] < 5.0:
+                continue
+
+            # 过滤 2：近一周（含当日，向前 6 个交易日）出现过涨停（涨幅>=9.5%）
+            if limit_up is not None and limit_up[i]:
+                continue
+
+            # 条件 1：位置确认 —— MACD 柱 < 0（处于绿柱区）
             if not (macd_col[i] < 0):
                 continue
 
-            # 条件 2：MACD 柱连续 2 天增大（3 天序列递增）
-            if not (macd_col[i] > macd_col[i-1] > macd_col[i-2]):
+            # 条件 2：加速确认 —— 从前天 (i-2) 到今天，MACD 柱从低点回升 ≥ 30%
+            #   （不再看3天内最低点，也不要求逐日递增，仅看两天跨度的收窄幅度）
+            if i < 2:
+                continue
+            if np.isnan(macd_col[i-2]) or np.isnan(macd_col[i]):
+                continue
+            if macd_col[i-2] >= 0 or macd_col[i] >= 0:
+                continue
+            # 比例：(macd[i] - macd[i-2]) / |macd[i-2]|
+            # 例：前天=-0.8，今天=-0.4，比例 = 0.4/0.8 = 0.5 = 50%
+            ratio_two_day = (macd_col[i] - macd_col[i-2]) / abs(macd_col[i-2])
+            if ratio_two_day < 0.30:
                 continue
 
-            # 条件 3：3 天内 MACD 柱绝对值缩短 ≥ 30%
-            if np.isnan(macd_col[i-3]) or abs(macd_col[i-3]) == 0:
-                continue
-            if not (abs(macd_col[i]) < 0.7 * abs(macd_col[i-3])):
-                continue
-
-            # 条件 4：DIF 今日向上（趋势变好）
+            # 条件 3：方向确认 —— DIF 拐头向上
             if not (dif[i] > dif[i-1]):
                 continue
-
-            # 条件 5：当日成交量 > 20 日均量
-            if vol is not None and vol_ma20 is not None:
-                if np.isnan(vol[i]) or np.isnan(vol_ma20[i]) or vol_ma20[i] <= 0:
-                    continue
-                if not (vol[i] > vol_ma20[i]):
-                    continue
-
-            # 条件 6：明天涨幅 < 5% 即可出现金叉
-            if ema12 is not None and ema26 is not None and close[i] > 0:
-                # DIF_next = dif_alpha * P + (1-alpha12)*ema12[i] - (1-alpha26)*ema26[i]
-                # 临界条件：DIF_next >= DEA[i]
-                const_term = (1 - alpha12) * ema12[i] - (1 - alpha26) * ema26[i]
-                p_cross = (dea[i] - const_term) / dif_alpha
-                needed_pct = (p_cross - close[i]) / close[i] * 100.0
-                if np.isnan(needed_pct) or needed_pct >= 5.0:
-                    continue
-                if needed_pct < 0:
-                    continue  # 低于当前价 → 已金叉不需预测
-                signals.iloc[i] = 1
-            else:
+            if not (dif[i-1] <= dif[i-2]):
                 continue
+
+            # 条件 4：趋势过滤 —— 收盘价 > MA10 / MA20 中任意一条
+            ma10 = df['ma10'].values.astype(float) if 'ma10' in df.columns else None
+            ma20_cond = (ma20 is not None and not np.isnan(ma20[i]) and close[i] > ma20[i])
+            ma10_cond = (ma10 is not None and not np.isnan(ma10[i]) and close[i] > ma10[i])
+            if not (ma20_cond or ma10_cond):
+                continue
+
+            # 条件 5：资金确认 —— 收阳线 且 成交量 > 5日均量 * 1.1
+            if high is not None and low is not None:
+                body_real = (close[i] > close[i-1])  # 收阳线（相对昨日收盘价）
+            else:
+                body_real = (close[i] > close[i-1])
+            if not body_real:
+                continue
+            if vol is not None and vol_ma5 is not None:
+                if np.isnan(vol[i]) or np.isnan(vol_ma5[i]) or vol_ma5[i] <= 0:
+                    continue
+                if not (vol[i] > vol_ma5[i] * 1.1):
+                    continue
+
+            signals.iloc[i] = 1
 
         return signals
 
@@ -268,38 +299,28 @@ class MACDPredictiveCrossStrategy(BaseStrategy):
         dif = df['dif'].values.astype(float)
         macd_col = df['macd'].values.astype(float)
         close = df['close'].values.astype(float)
-        ema12 = df['ema12'].values.astype(float) if 'ema12' in df.columns else None
-        ema26 = df['ema26'].values.astype(float) if 'ema26' in df.columns else None
-        vol = None
-        vol_ma20 = None
-        if 'volume' in df.columns and 'vol_ma20' in df.columns:
-            vol = df['volume'].values.astype(float)
-            vol_ma20 = df['vol_ma20'].values.astype(float)
-
-        alpha12 = 2.0 / 13.0
-        alpha26 = 2.0 / 27.0
-        dif_alpha = alpha12 - alpha26
 
         for i in range(len(df)):
             if int(signals.iloc[i]) != 1:
                 continue
             parts = []
             parts.append(f"MACD柱={macd_col[i]:.4f}")
-            if i >= 3 and not np.isnan(macd_col[i-3]) and abs(macd_col[i-3]) > 0:
-                shrink_pct = (1 - abs(macd_col[i]) / abs(macd_col[i-3])) * 100
-                parts.append(f"3日缩短{shrink_pct:.0f}%")
-            parts.append(f"DIF={dif[i]:.4f}(向上)")
-
-            if ema12 is not None and ema26 is not None and close[i] > 0:
-                const_term = (1 - alpha12) * ema12[i] - (1 - alpha26) * ema26[i]
-                p_cross = (df['dea'].values.astype(float)[i] - const_term) / dif_alpha
-                needed_pct = (p_cross - close[i]) / close[i] * 100.0
-                if 0 <= needed_pct < 5:
-                    parts.append(f"需涨{needed_pct:.2f}%")
-
-            if vol is not None and vol_ma20 is not None and not np.isnan(vol[i]) and vol_ma20[i] > 0:
-                ratio = vol[i] / vol_ma20[i]
-                parts.append(f"量比={ratio:.2f}")
+            if i >= 2 and not np.isnan(macd_col[i-2]) and macd_col[i-2] < 0 and macd_col[i] < 0:
+                ratio_two_day = (macd_col[i] - macd_col[i-2]) / abs(macd_col[i-2])
+                parts.append(f"从前天回升={ratio_two_day * 100:.1f}%")
+            parts.append(f"DIF={dif[i]:.4f}(拐头向上)")
+            # 报告能站上哪条均线就显示哪条（MA10 / MA20）
+            for col, label in (('ma10', 'MA10'), ('ma20', 'MA20')):
+                if col in df.columns:
+                    val = float(df[col].iloc[i])
+                    if not np.isnan(val) and val > 0 and close[i] > val:
+                        parts.append(f"收>{label}({close[i]:.2f}>{val:.2f})")
+                        break
+            if 'volume' in df.columns and 'vol_ma5' in df.columns:
+                vi = float(df['volume'].iloc[i])
+                vm5 = float(df['vol_ma5'].iloc[i])
+                if vm5 > 0:
+                    parts.append(f"量比={vi / vm5:.2f}")
             reasons.iloc[i] = " | ".join(parts)
         return reasons
 
@@ -311,62 +332,183 @@ class MACDPredictiveCrossStrategy(BaseStrategy):
         dif = df['dif'].values.astype(float)
         macd_col = df['macd'].values.astype(float)
         close = df['close'].values.astype(float)
-        ema12 = df['ema12'].values.astype(float) if 'ema12' in df.columns else None
-        ema26 = df['ema26'].values.astype(float) if 'ema26' in df.columns else None
-        vol = None
-        vol_ma20 = None
-        if 'volume' in df.columns and 'vol_ma20' in df.columns:
-            vol = df['volume'].values.astype(float)
-            vol_ma20 = df['vol_ma20'].values.astype(float)
-
-        alpha12 = 2.0 / 13.0
-        alpha26 = 2.0 / 27.0
-        dif_alpha = alpha12 - alpha26
 
         for i in range(len(df)):
             if int(signals.iloc[i]) != 1:
                 continue
-            s = 55.0
+            s = 60.0
 
-            # MACD柱3日缩短比例加分（缩得越多越强）
-            if i >= 3 and not np.isnan(macd_col[i-3]) and abs(macd_col[i-3]) > 0:
-                shrink_pct = (1 - abs(macd_col[i]) / abs(macd_col[i-3])) * 100
-                if shrink_pct >= 80:
-                    s += 20
-                elif shrink_pct >= 70:
+            # 1) MACD 柱增量放大 → 加分
+            if i >= 2:
+                delta_i = macd_col[i] - macd_col[i-1]
+                delta_i_1 = macd_col[i-1] - macd_col[i-2]
+                if delta_i_1 > 0 and delta_i / delta_i_1 > 1.5:
                     s += 15
-                elif shrink_pct >= 50:
-                    s += 10
+                elif delta_i > delta_i_1:
+                    s += 8
 
-            # 需涨幅度加分（涨越少越强）
-            if ema12 is not None and ema26 is not None and close[i] > 0:
-                const_term = (1 - alpha12) * ema12[i] - (1 - alpha26) * ema26[i]
-                p_cross = (df['dea'].values.astype(float)[i] - const_term) / dif_alpha
-                needed_pct = (p_cross - close[i]) / close[i] * 100.0
-                if 0 <= needed_pct < 5:
-                    if needed_pct < 0.5:
-                        s += 20
-                    elif needed_pct < 1.0:
-                        s += 15
-                    elif needed_pct < 2.0:
-                        s += 10
-                    else:
-                        s += 5
-
-            # 量比加分
-            if vol is not None and vol_ma20 is not None and not np.isnan(vol[i]) and vol_ma20[i] > 0:
-                ratio = vol[i] / vol_ma20[i]
-                if ratio >= 2.0:
-                    s += 15
-                elif ratio >= 1.5:
+            # 2) DIF 拐头角度
+            if i >= 2:
+                turn = (dif[i] - dif[i-1]) + max(0, dif[i-1] - dif[i-2])
+                if turn > 0.05:
                     s += 10
-                elif ratio > 1.0:
+                elif turn > 0:
                     s += 5
 
-            # 价格在 MA20 上方加分（趋势健康）
-            row = df.iloc[i]
-            if pd.notna(row.get('ma20')) and float(row['close']) > float(row['ma20']):
-                s += 10
+            # 3) 收 > MA20 距离
+            if 'ma20' in df.columns:
+                ma20 = float(df['ma20'].iloc[i]) if not pd.isna(df['ma20'].iloc[i]) else None
+                if ma20 is not None and ma20 > 0:
+                    bias = (close[i] - ma20) / ma20
+                    if bias > 0.03:
+                        s += 10
+                    elif bias > 0:
+                        s += 5
+
+            # 4) 量比（温和放量）
+            if 'volume' in df.columns and 'vol_ma5' in df.columns:
+                vi = float(df['volume'].iloc[i])
+                vm5 = float(df['vol_ma5'].iloc[i])
+                if vm5 > 0:
+                    ratio = vi / vm5
+                    if ratio >= 2.5:
+                        s += 15
+                    elif ratio >= 2.0:
+                        s += 10
+                    elif ratio > 1.2:
+                        s += 5
 
             strength.iloc[i] = min(s, 100)
         return strength
+
+    def diagnose_last_row(self, df: pd.DataFrame) -> Dict[str, Any]:
+        """对最后一根K线逐条检查新的 6 个买入条件，返回详细诊断"""
+        n = len(df)
+        base = super().diagnose_last_row(df)
+        if n < 35:
+            return base
+
+        conditions = []
+
+        dif = df['dif'].values.astype(float)
+        macd_col = df['macd'].values.astype(float)
+        close = df['close'].values.astype(float)
+        ma20 = df['ma20'].values.astype(float) if 'ma20' in df.columns else None
+        vol = df['volume'].values.astype(float) if 'volume' in df.columns else None
+        vol_ma5 = df['vol_ma5'].values.astype(float) if 'vol_ma5' in df.columns else None
+
+        i = n - 1
+
+        # 过滤 1：价格
+        ok = not (np.isnan(close[i]) or close[i] < 5.0)
+        conditions.append({
+            'name': '价格 >= 5元',
+            'ok': bool(ok),
+            'detail': f"当前价={close[i]:.2f}" if ok else f"当前价={close[i]:.2f}，低于5元阈值",
+        })
+
+        # 过滤 2：近 6 天是否有涨停
+        wmax = 0.0
+        limit_up_hit = False
+        if n > 1:
+            prev_close = np.roll(close, 1)
+            prev_close[0] = np.nan
+            with np.errstate(invalid='ignore', divide='ignore'):
+                daily_pct = np.where(
+                    (prev_close > 0) & (~np.isnan(prev_close)) & (~np.isnan(close)),
+                    (close - prev_close) / prev_close * 100.0,
+                    0.0,
+                )
+            start = max(0, i - 5)
+            seg = daily_pct[start:i + 1]
+            all_nan = bool(np.all(np.isnan(seg))) if seg.size else True
+            wmax = 0.0 if all_nan else float(np.nanmax(seg))
+            limit_up_hit = (not np.isnan(wmax)) and wmax >= 9.5
+        conditions.append({
+            'name': '近1周未涨停',
+            'ok': bool(not limit_up_hit),
+            'detail': f"近6日最高涨幅={wmax:.2f}%" if n > 1 else "数据不足",
+        })
+
+        # 条件 1：MACD 柱 < 0（绿柱）
+        ok = macd_col[i] < 0
+        conditions.append({
+            'name': 'MACD绿柱（MACD < 0）',
+            'ok': bool(ok),
+            'detail': f"MACD={macd_col[i]:.4f}",
+        })
+
+        # 条件 2：从前天 (i-2) 到今天，MACD 柱回升 ≥ 30%
+        if i >= 2 and not np.isnan(macd_col[i-2]) and not np.isnan(macd_col[i]) \
+                and macd_col[i-2] < 0 and macd_col[i] < 0:
+            ratio_two_day = (macd_col[i] - macd_col[i-2]) / abs(macd_col[i-2])
+            ok = ratio_two_day >= 0.30
+            detail = (f"macd[i]={macd_col[i]:.4f}, macd[i-2]={macd_col[i-2]:.4f}, "
+                      f"从前天回升={ratio_two_day * 100:.1f}%（阈值30%）")
+        else:
+            ok, detail = False, "MACD柱数据不满足负数条件或索引不足"
+        conditions.append({
+            'name': 'MACD柱从前天回升≥30%',
+            'ok': bool(ok),
+            'detail': detail,
+        })
+
+        # 条件 3：DIF 拐头向上
+        if i >= 2:
+            ok = (dif[i] > dif[i-1]) and (dif[i-1] <= dif[i-2])
+            conditions.append({
+                'name': 'DIF拐头向上',
+                'ok': bool(ok),
+                'detail': f"DIF[{i}]={dif[i]:.4f}, [{i-1}]={dif[i-1]:.4f}, [{i-2}]={dif[i-2]:.4f}",
+            })
+        else:
+            conditions.append({'name': 'DIF拐头向上', 'ok': False, 'detail': '索引不足'})
+
+        # 条件 4：趋势过滤 —— 收盘价 > MA10 / MA20 中任意一条
+        if ma20 is not None and not np.isnan(ma20[i]) and ma20[i] > 0:
+            ma10 = df['ma10'].values.astype(float) if 'ma10' in df.columns else None
+            ma20_cond = close[i] > ma20[i]
+            ma10_cond = (ma10 is not None and not np.isnan(ma10[i]) and close[i] > ma10[i])
+            ok = ma20_cond or ma10_cond
+            detail_parts = []
+            if ma10 is not None and not np.isnan(ma10[i]):
+                detail_parts.append(f"close>ma10={ma10_cond}({close[i]:.2f} vs {ma10[i]:.2f})")
+            detail_parts.append(f"close>ma20={ma20_cond}({close[i]:.2f} vs {ma20[i]:.2f})")
+            conditions.append({
+                'name': '收盘价 > MA10/MA20 中任意一条',
+                'ok': bool(ok),
+                'detail': '；'.join(detail_parts),
+            })
+        else:
+            conditions.append({
+                'name': '收盘价 > MA10/MA20 中任意一条',
+                'ok': False,
+                'detail': 'MA20 数据缺失',
+            })
+
+        # 条件 5：资金确认 —— 收阳线 且 量比 > 1.1
+        if i >= 1:
+            body_ok = close[i] > close[i-1]
+        else:
+            body_ok = False
+        if vol is not None and vol_ma5 is not None and not np.isnan(vol[i]) and vol_ma5[i] > 0:
+            ratio = vol[i] / vol_ma5[i]
+            vol_ok = ratio > 1.1
+            detail_vol = f"量比={ratio:.2f}（volume={vol[i]:.0f}, vol_ma5={vol_ma5[i]:.0f}）"
+        else:
+            vol_ok = False
+            detail_vol = "成交量/5日均量 数据缺失"
+        ok = body_ok and vol_ok
+        conditions.append({
+            'name': '收阳线 且 成交量 > 5日均量 * 1.1',
+            'ok': bool(ok),
+            'detail': f"阳线={'是' if body_ok else '否'} | {detail_vol}",
+        })
+
+        ok_all = all(c['ok'] for c in conditions)
+        lines = [f"  {'✅' if c['ok'] else '❌'}  {c['name']} → {c['detail']}" for c in conditions]
+        return {
+            'ok': bool(ok_all),
+            'conditions': conditions,
+            'text': '\n'.join(lines),
+        }

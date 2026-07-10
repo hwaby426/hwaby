@@ -1,16 +1,20 @@
 import sys
 import time
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
-
-import baostock as bs
+from typing import Dict, List, Optional, Tuple
 import pandas as pd
 from loguru import logger
-from tqdm import tqdm
+
+import baostock as bs
 
 from db.database import session_scope
 from db.models import StockInfo, DailyKline
 from config.settings import settings, BASE_DIR
+from concurrent.futures import ThreadPoolExecutor, as_completed, thread
+import threading
+
+# 每个线程独立登录 BaoStock，避免全局 session 冲突
+_bs_thread_local = threading.local()
 
 sys.path.insert(0, str(BASE_DIR))
 
@@ -21,11 +25,13 @@ BS_FIELDS = (
     "turn,pctChg,isST"
 )
 
-_request_interval = 0.2
+# ── 请求限速（单线程串行访问 BaoStock）
+# 默认 0.05s 已经比较合理；经过实测，可以到 0.02-0.05
+_request_interval = 0.02
 _last_request_time = 0.0
-_min_interval = 0.1
-_max_interval = 0.5
-_base_interval = 0.2
+_min_interval = 0.01
+_max_interval = 1.0
+_base_interval = 0.02
 
 
 def _rate_limit():
@@ -101,6 +107,12 @@ def bs_logout():
         logger.info("BaoStock 登出")
     except Exception as e:
         logger.debug(f"BaoStock 登出异常: {e}")
+
+
+# ── 线程级登录：确保每个线程有独立 session，baostock 是进程级的
+#    更安全的做法是：单线程串行访问，由上层用"生产/消费"模型去并发处理非网络任务
+#    为兼顾安全性，这里仅在单线程内部做串行请求，但不再每请求都重登录。
+#    如果在多线程中使用，必须保证每个线程"先登录，再用，最后登出"。
 
 
 def fetch_stock_list(day: Optional[str] = None) -> List[dict]:
@@ -273,12 +285,13 @@ def save_daily_klines(code: str, df: pd.DataFrame):
         session.execute(sql, rows)
 
 
-def save_daily_klines_batch(rows: List[dict], batch_size: int = 3000) -> int:
+def save_daily_klines_batch(rows: List[dict], batch_size: int = 3000, log_prefix: str = "") -> int:
     """批量插入多只股票的K线数据
 
     Args:
-        rows: 字典列表，每 dict 包含 code, trade_date, open, high, low, close, volume, amount, pct_chg, turnover, adjustflag
+        rows: 字典列表，每 dict 包含 code, trade_date, ...
         batch_size: 每批插入的行数，避免 SQL 过长
+        log_prefix: 可选前缀，用于区分不同批次场景
 
     Returns:
         实际插入的总行数
@@ -289,28 +302,36 @@ def save_daily_klines_batch(rows: List[dict], batch_size: int = 3000) -> int:
     from sqlalchemy import text
 
     total = 0
+    logged_once = False
     for start_i in range(0, len(rows), batch_size):
         batch = rows[start_i:start_i + batch_size]
-        with session_scope() as session:
-            sql = text("""
-                INSERT INTO daily_kline
-                    (code, trade_date, open, high, low, close, volume, amount, pct_chg, turnover, adjustflag, created_at)
-                VALUES
-                    (:code, :trade_date, :open, :high, :low, :close, :volume, :amount, :pct_chg, :turnover, :adjustflag, NOW())
-                ON DUPLICATE KEY UPDATE
-                    open = VALUES(open),
-                    high = VALUES(high),
-                    low = VALUES(low),
-                    close = VALUES(close),
-                    volume = VALUES(volume),
-                    amount = VALUES(amount),
-                    pct_chg = VALUES(pct_chg),
-                    turnover = VALUES(turnover)
-            """)
-            session.execute(sql, batch)
-        total += len(batch)
-        logger.info(f"[批量存储] 已写入 {total}/{len(rows)} 条")
+        try:
+            with session_scope() as session:
+                sql = text("""
+                    INSERT INTO daily_kline
+                        (code, trade_date, open, high, low, close, volume, amount, pct_chg, turnover, adjustflag, created_at)
+                    VALUES
+                        (:code, :trade_date, :open, :high, :low, :close, :volume, :amount, :pct_chg, :turnover, :adjustflag, NOW())
+                    ON DUPLICATE KEY UPDATE
+                        open = VALUES(open),
+                        high = VALUES(high),
+                        low = VALUES(low),
+                        close = VALUES(close),
+                        volume = VALUES(volume),
+                        amount = VALUES(amount),
+                        pct_chg = VALUES(pct_chg),
+                        turnover = VALUES(turnover)
+                """)
+                session.execute(sql, batch)
+            total += len(batch)
+        except Exception as e:
+            logger.warning(f"{log_prefix}写入 {len(batch)} 条失败: {e}")
+        # 仅在第一次成功时打印一次（避免刷屏）
+        if not logged_once:
+            logged_once = True
+            logger.info(f"{log_prefix}开始写入 {len(rows)} 条K线...")
 
+    logger.info(f"{log_prefix}写入完成: {total}/{len(rows)} 条K线")
     return total
 
 
@@ -354,18 +375,21 @@ def update_single_stock(code: str, end_date: str = None) -> int:
 
 def update_all_daily_klines(
     stock_pool: Optional[List[str]] = None,
+    max_workers: int = 1,  # 默认串行（BaoStock 对多线程/多 session 支持有限，保持串行更稳）
+    save_interval: int = 200,  # 每收集 N 只股票的 K 线，写一次数据库
 ):
     """批量更新全市场日线数据
 
-    优化点：
-    1. 一次性查询所有股票的最后日期（1 条 SQL）
-    2. 仅对需要更新的股票调用 API
-    3. 收集所有新 K 线到内存，最后批量插入数据库
+    流程（串行）：
+      1. 一次查询所有股票的最后K线日期（1 条 SQL）
+      2. 仅对需要更新的股票调用 API（串行请求，避免 BaoStock 限流）
+      3. 内存收集新 K 线，批次满 save_interval 只 → 批量写入
+      4. 失败时自动重登录（不做 100 只周期性重登录）
 
-    支持 CTRL+C 中断，已获取的数据仍会被写入
+    支持 CTRL+C 中断，已获取的数据仍会被写入。
     """
     if not bs_login():
-        return
+        return 0
     try:
         if not stock_pool:
             stock_pool = settings.get_stock_pool()
@@ -380,7 +404,7 @@ def update_all_daily_klines(
         logger.info(f"[步骤1] 已查询 {len(last_dates)} 只股票的本地最后日期")
 
         # ── 2. 筛选需要更新的股票 ──────────────
-        to_update = []  # [(norm_code, start_date, end_date), ...]
+        to_update: List[Tuple[str, str, str]] = []
         already_latest = 0
         for code in stock_pool:
             norm_code = normalize_code(code)
@@ -401,24 +425,24 @@ def update_all_daily_klines(
             f"[步骤2] 需要更新: {len(to_update)} 只, 已是最新: {already_latest} 只"
         )
 
-        # ── 3. 批量获取K线数据并收集到内存 ──────
-        all_rows = []  # 所有股票的新 K 线
+        # ── 3. 串行获取K线 + 按 batch_size 批量写入
+        all_rows = []
+        batch_rows = []  # 当前批次，满 save_interval 写一次
         total_klines = 0
         failed = 0
-        login_count = 1  # 已登录次数（用于周期性重登录）
-        RELogIN_INTERVAL = 100  # 每处理 N 只股票自动重登录一次（session约100次请求后失效）
         start_time = datetime.now()
+        LOG_INTERVAL = 100  # 每 100 只打印一次进度（约 4-5 分钟一次）
 
         for i, (norm_code, start_date, code_end) in enumerate(to_update, 1):
-            retry_success = False
-            # 每只股票最多重试 2 次（每次失败都先重登录）
-            for attempt in range(2):
+            rows = None
+            for attempt in range(3):  # 最多 3 次尝试（每次失败都自动重登录）
                 try:
                     df = fetch_daily_kline(norm_code, start_date, code_end)
                     if not df.empty:
                         adjust_flag = int(ADJUST_FLAG)
+                        rows = []
                         for _, row in df.iterrows():
-                            all_rows.append({
+                            rows.append({
                                 'code': norm_code,
                                 'trade_date': row['date'],
                                 'open': float(row['open']),
@@ -432,42 +456,54 @@ def update_all_daily_klines(
                                 'adjustflag': adjust_flag,
                             })
                         total_klines += len(df)
-                    _speed_up()  # 成功则逐步降低延迟
-                    retry_success = True
-                    break
-
+                    _speed_up()
+                    break  # 成功，跳出重试
                 except Exception as e:
                     err_msg = str(e)
-                    # 识别 session 相关错误，触发重登录（session 失效≠被限流，不减速）
+                    # 识别 session/网络错误 → 重登录（不减速）
                     if any(k in err_msg for k in [
                         "10054", "连接被重置", "远程主机强迫关闭",
                         "网络接收错误", "用户未登录", "you don't login", "login",
                     ]):
-                        logger.warning(f"{norm_code} session失效({err_msg})，重新登录 BaoStock...")
+                        logger.warning(f"{norm_code} session失效，重新登录 BaoStock...")
                         try:
-                            bs_logout()
+                            bs.logout()
                         except Exception:
                             pass
-                        time.sleep(1)  # 缩短等待，尽快恢复
+                        time.sleep(1)
                         if bs_login():
-                            login_count += 1
-                            _reset_interval()  # 重登录成功后重置请求间隔
-                            continue  # 重登录成功，重试当前股票
+                            _reset_interval()
+                            continue
                         time.sleep(3)
-                    else:
-                        # 非 session 错误（如数据格式问题），才考虑减速
-                        _slow_down()
-                    # 非 session 问题，或重登录失败，记录后放弃
-                    failed += 1
-                    if failed <= 5:
-                        logger.error(f"{norm_code} 失败(尝试{attempt+1}次): {e}")
-                    break
+                        continue
+                    # 其它错误（如被限流）→ 减速 + 重试
+                    _slow_down()
+                    if attempt == 0:
+                        logger.warning(f"{norm_code} 失败(第{attempt+1}次): {e}")
+                    time.sleep(0.5 + attempt)
+            else:
+                # 3 次都失败
+                failed += 1
+                if failed <= 5:
+                    logger.warning(f"{norm_code} 最终失败，跳过")
 
-            if not retry_success and failed <= 5:
-                logger.error(f"{norm_code} 最终失败，跳过")
+            if rows:
+                batch_rows.extend(rows)
+
+            # 批量写库，减少 IO 抖动
+            if len(batch_rows) >= save_interval * 5 or i % save_interval == 0:
+                if batch_rows:
+                    try:
+                        save_daily_klines_batch(batch_rows, batch_size=3000)
+                    except Exception as e:
+                        logger.warning(f"批量写入 {len(batch_rows)} 条失败: {e}")
+                    else:
+                        all_rows.extend(batch_rows)
+                    finally:
+                        batch_rows = []
 
             # 进度日志
-            if i % 200 == 0:
+            if i % LOG_INTERVAL == 0:
                 elapsed = (datetime.now() - start_time).total_seconds()
                 speed = i / elapsed if elapsed > 0 else 0
                 remaining = (len(to_update) - i) / speed if speed > 0 else 0
@@ -475,48 +511,39 @@ def update_all_daily_klines(
                     f"[进度] {i:>5}/{len(to_update)} "
                     f"已获取K线:{total_klines:>6} "
                     f"速度:{speed:.1f}只/秒 "
+                    f"失败:{failed} "
                     f"预计剩余:{remaining/60:.0f}分钟"
                 )
 
-            # 每 N 只股票自动重登录一次，防止 session 过期
-            if i % RELogIN_INTERVAL == 0:
-                logger.info(f"[连接维护] 已处理 {i} 只，自动重登录 BaoStock...")
-                try:
-                    bs_logout()
-                except Exception:
-                    pass
-                time.sleep(1)  # 缩短等待
-                if bs_login():
-                    login_count += 1
-                    _reset_interval()  # 重置请求间隔
-                else:
-                    logger.warning("重登录失败，继续尝试...")
-                    time.sleep(3)
-                    bs_login()
-                    login_count += 1
-                    _reset_interval()
+        # 最后 flush 一次 batch
+        if batch_rows:
+            try:
+                save_daily_klines_batch(batch_rows, batch_size=3000)
+                all_rows.extend(batch_rows)
+            except Exception as e:
+                logger.warning(f"最后一次批量写入失败: {e}")
 
-        logger.info(f"[步骤3] 数据获取完成，共 {total_klines} 条新K线，失败 {failed} 只, 重登录 {login_count-1} 次")
-
-        # ── 4. 批量写入数据库 ──────────────────
-        if all_rows:
-            logger.info(f"[步骤4] 开始批量写入 {len(all_rows)} 条K线数据...")
-            saved = save_daily_klines_batch(all_rows, batch_size=3000)
-            logger.info(f"[步骤4] 批量写入完成: {saved} 条K线")
-        else:
-            logger.info("[步骤4] 没有新数据需要写入")
+        logger.info(
+            f"[步骤3] 数据获取完成，共 {total_klines} 条新K线，失败 {failed} 只"
+        )
 
         logger.info(f"日线更新完成，共新增/更新 {total_klines} 条K线")
         return total_klines
 
     except KeyboardInterrupt:
         logger.info("收到中断信号，写入已获取的数据后停止...")
-        if 'all_rows' in dir() and all_rows:
-            logger.info(f"写入已获取的 {len(all_rows)} 条K线...")
-            save_daily_klines_batch(all_rows, batch_size=3000)
+        if batch_rows:  # type: ignore
+            try:
+                save_daily_klines_batch(batch_rows, batch_size=3000)  # type: ignore
+            except Exception:
+                pass
         return total_klines if 'total_klines' in dir() else 0
     finally:
-        bs_logout()
+        try:
+            bs.logout()
+            logger.info("BaoStock 登出")
+        except Exception:
+            pass
 
 
 def init_all_stocks(stock_pool: Optional[List[str]] = None):
