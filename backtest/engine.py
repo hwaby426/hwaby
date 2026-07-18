@@ -236,6 +236,48 @@ class BacktestEngine:
             equity = cash + position * close_price
             equity_list.append(equity)
 
+        # 如果回测结束时仍有持仓未平仓，按最后一根真实K线的收盘价卖出（估值）
+        # 这样胜率、盈亏比等指标能正确反映所有交易的收益情况
+        if position > 0 and n > 0:
+            # 使用最后一根真实K线的收盘价作为卖出价
+            last_real_idx = n - 2  # 倒数第二行是最后一根真实K线（最后一行是合成K线）
+            if last_real_idx < 0:
+                last_real_idx = n - 1
+            sell_price = float(df[close_col].iloc[last_real_idx]) * (1 - self.slippage_rate)
+            sell_amount = sell_price * position
+            commission = max(sell_amount * self.commission_rate, self.min_commission)
+            stamp = sell_amount * self.stamp_duty_rate
+            income = sell_amount - commission - stamp
+            pnl = income - (cost_price * position)
+            pnl_pct = (sell_price / cost_price - 1) * 100
+            hold_days = (n - 1) - buy_date_idx
+
+            logger.info(
+                f"[强制卖出(未平仓)] [{strategy_name}] {str(df[date_col].iloc[last_real_idx])} {code} "
+                f"价格={round(sell_price, 3)} 数量={position} "
+                f"金额={round(sell_amount, 2)} 盈亏={round(pnl, 2)}({round(pnl_pct, 2)}%) "
+                f"持有天数={hold_days}"
+            )
+
+            trades.append(Trade(
+                code=code,
+                trade_type=-1,
+                trade_time=str(df[date_col].iloc[last_real_idx]),
+                price=round(sell_price, 3),
+                quantity=position,
+                amount=round(sell_amount, 2),
+                commission=round(commission + stamp, 2),
+                pnl=round(pnl, 2),
+                pnl_pct=round(pnl_pct, 2),
+                hold_days=hold_days,
+            ))
+            cash += income
+            position = 0
+            cost_price = 0.0
+
+            # 更新权益曲线最后一个值（加上强制卖出后的现金）
+            equity_list[-1] = cash
+
         equity_series = pd.Series(equity_list, index=df[date_col] if date_col in df.columns else range(n))
         final_capital = equity_list[-1]
 

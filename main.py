@@ -576,7 +576,14 @@ def compare_all(codes, all_code, strategies, start, end, capital, period, top_n,
             code_list = [normalize_code(c) for c in raw_codes]
             logger.info(f"配置池为空，使用全市场股票: {len(code_list)} 只")
 
-    # 2. 测试限制
+    # 2. 剔除受限板块（科创板/北交所，未开户无权限）
+    from scheduler.market_scan import _is_restricted
+    restricted_count = sum(1 for c in code_list if _is_restricted(c))
+    if restricted_count > 0:
+        code_list = [c for c in code_list if not _is_restricted(c)]
+        logger.info(f"剔除受限板块 {restricted_count} 只，剩余 {len(code_list)} 只")
+
+    # 3. 测试限制
     if max_stocks:
         code_list = code_list[:max_stocks]
         logger.info(f"测试模式：只处理前 {max_stocks} 只")

@@ -189,11 +189,11 @@ class MACDPredictiveCrossStrategy(BaseStrategy):
       2. 加速确认：从前天 (i-2) 到今天，MACD 柱回升 ≥ 30%（仅看两天跨度的收窄幅度，不要求连续增大）
       3. 方向确认：DIF[i] > DIF[i-1] 且 DIF[i-1] <= DIF[i-2]（DIF 拐头向上）
       4. 趋势过滤：收盘价 > MA10 / MA20 中任意一条（站上 10 日或 20 日均线，避免下跌中继）
-      5. 资金确认：收阳线 且 成交量 > 5日均量 * 1.1（真金白银温和放量）
+      5. 资金确认：成交量 > 5日均量 * 1.1（真金白银温和放量，不再强制阳线）
     """
 
     name = "MACD预测金叉"
-    description = "MACD绿柱加速收缩 + DIF拐头 + 股价站上MA20 + 放量阳线"
+    description = "MACD绿柱加速收缩 + DIF拐头 + 股价站上MA20 + 放量"
 
     def generate_signals(self, df: pd.DataFrame) -> pd.Series:
         signals = pd.Series(np.zeros(len(df)), index=df.index, dtype=int)
@@ -274,13 +274,7 @@ class MACDPredictiveCrossStrategy(BaseStrategy):
             if not (ma20_cond or ma10_cond):
                 continue
 
-            # 条件 5：资金确认 —— 收阳线 且 成交量 > 5日均量 * 1.1
-            if high is not None and low is not None:
-                body_real = (close[i] > close[i-1])  # 收阳线（相对昨日收盘价）
-            else:
-                body_real = (close[i] > close[i-1])
-            if not body_real:
-                continue
+            # 条件 5：资金确认 —— 成交量 > 5日均量 * 1.1
             if vol is not None and vol_ma5 is not None:
                 if np.isnan(vol[i]) or np.isnan(vol_ma5[i]) or vol_ma5[i] <= 0:
                     continue
@@ -486,11 +480,7 @@ class MACDPredictiveCrossStrategy(BaseStrategy):
                 'detail': 'MA20 数据缺失',
             })
 
-        # 条件 5：资金确认 —— 收阳线 且 量比 > 1.1
-        if i >= 1:
-            body_ok = close[i] > close[i-1]
-        else:
-            body_ok = False
+        # 条件 5：资金确认 —— 量比 > 1.1
         if vol is not None and vol_ma5 is not None and not np.isnan(vol[i]) and vol_ma5[i] > 0:
             ratio = vol[i] / vol_ma5[i]
             vol_ok = ratio > 1.1
@@ -498,11 +488,10 @@ class MACDPredictiveCrossStrategy(BaseStrategy):
         else:
             vol_ok = False
             detail_vol = "成交量/5日均量 数据缺失"
-        ok = body_ok and vol_ok
         conditions.append({
-            'name': '收阳线 且 成交量 > 5日均量 * 1.1',
-            'ok': bool(ok),
-            'detail': f"阳线={'是' if body_ok else '否'} | {detail_vol}",
+            'name': '成交量 > 5日均量 * 1.1',
+            'ok': bool(vol_ok),
+            'detail': detail_vol,
         })
 
         ok_all = all(c['ok'] for c in conditions)
