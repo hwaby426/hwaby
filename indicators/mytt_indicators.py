@@ -106,14 +106,15 @@ def calc_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     df = df.copy()
-    df = calc_ma(df)
-    df = calc_macd(df)
-    df = calc_kdj(df)
-    df = calc_rsi(df)
-    df = calc_boll(df)
-    df = calc_cci(df)
-    df = calc_atr(df)
-    df = calc_bias(df)
-    df = calc_wr(df)
-    df = calc_volume_ma(df)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        df = calc_ma(df)
+        df = calc_macd(df)
+        df = calc_kdj(df)
+        df = calc_rsi(df)
+        df = calc_boll(df)
+        df = calc_cci(df)
+        df = calc_atr(df)
+        df = calc_bias(df)
+        df = calc_wr(df)
+        df = calc_volume_ma(df)
     return df

@@ -21,7 +21,9 @@ class Settings:
             f"@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}?charset=utf8mb4"
         )
 
-    DAILY_UPDATE_TIME = os.getenv('DAILY_UPDATE_TIME', '20:30')
+    # 必须收盘后跑：腾讯 qt.gtimg.cn 只有当前快照，漏一天永久缺失
+    DAILY_UPDATE_TIME = os.getenv('DAILY_UPDATE_TIME', '16:30')
+    # 旧 5/15min 盯盘遗留参数；1min 盯盘改用 MACD_POLL_INTERVAL
     REALTIME_POLL_INTERVAL = int(os.getenv('REALTIME_POLL_INTERVAL', 3))
 
     STOCK_POOL = os.getenv('STOCK_POOL', 'sz002624')
@@ -34,6 +36,14 @@ class Settings:
 
     LOG_DIR = BASE_DIR / 'logs'
     OUTPUT_DIR = BASE_DIR / 'output'
+
+    # 邮件配置
+    SEND_EMAIL = os.getenv('SEND_EMAIL', 'false').lower() == 'true'
+    EMAIL_TO = os.getenv('EMAIL_TO', '')
+    EMAIL_FROM = os.getenv('EMAIL_FROM', '')
+    EMAIL_PASS = os.getenv('EMAIL_PASS', '')
+    EMAIL_SMTP_SERVER = os.getenv('EMAIL_SMTP_SERVER', 'smtp.qq.com')
+    EMAIL_SMTP_PORT = int(os.getenv('EMAIL_SMTP_PORT', 587))
 
     @classmethod
     def get_stock_pool(cls):

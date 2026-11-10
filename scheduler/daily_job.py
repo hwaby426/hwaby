@@ -1,80 +1,41 @@
-from datetime import datetime, date
-from typing import List
+"""每日收盘后的全市场 K 线更新（腾讯通道）。
+
+BaoStock 已永久封号，旧链路 update_all_daily_klines / calc_all_daily_signals
+全部移除。这里只做一件事：调用 tools/update_daily_tencent.py，它内部依次
+完成 日线 → 估值 → 快照 → 特征，并做四项前置检查与收尾行数核对。
+"""
+from __future__ import annotations
+
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
 from loguru import logger
 
-from data_fetcher.baostock_fetcher import (
-    update_all_daily_klines,
-    get_daily_kline_df,
-    bs_login, bs_logout,
-    fetch_stock_list, sync_stock_info,
-)
-from signals.signal_service import generate_daily_signals_for_stock, save_signals
-from signals.manager import get_strategy_names
-from config.settings import settings
+BASE_DIR = Path(__file__).resolve().parent.parent
 
 
-def daily_update_job(stock_pool: List[str] = None):
-    logger.info("========== 开始每日日线更新任务 ==========")
+def run_daily_update(date: str | None = None, check: bool = False) -> int:
+    """跑一次腾讯日更，返回退出码。"""
+    cmd = [sys.executable, 'tools/update_daily_tencent.py']
+    if date:
+        cmd += ['--date', date]
+    if check:
+        cmd += ['--check']
+    logger.info('日更开始：' + ' '.join(cmd[1:]))
+    return subprocess.run(cmd, cwd=str(BASE_DIR)).returncode
+
+
+def daily_update_job(stock_pool=None, date: str | None = None) -> None:
+    """调度器入口。stock_pool 保留兼容参数（日更是全市场，不按池子过滤）。"""
     start = datetime.now()
-    kline_count = 0
-    signal_count = 0
+    logger.info('========== 开始每日全市场 K 线更新 ==========')
     try:
-        kline_count = update_all_daily_klines(stock_pool=stock_pool) or 0
-        signal_count = calc_all_daily_signals(stock_pool=stock_pool) or 0
+        rc = run_daily_update(date=date)
+        if rc != 0:
+            logger.error(f'日更脚本返回 {rc}，请查看上方日志（腾讯快照补不了历史）')
     except Exception as e:
-        logger.error(f"每日更新任务异常: {e}", exc_info=True)
+        logger.error(f'每日更新任务异常: {e}', exc_info=True)
     elapsed = (datetime.now() - start).total_seconds()
-    logger.info(f"========== 每日更新任务完成，新增K线 {kline_count} 条，新增信号 {signal_count} 条，耗时 {elapsed:.1f}s ==========")
-
-
-def calc_all_daily_signals(stock_pool: List[str] = None):
-    if not stock_pool:
-        stock_pool = settings.get_stock_pool()
-    if not stock_pool:
-        logger.warning("股票池为空，跳过信号计算")
-        return
-    logger.info(f"开始计算日线买卖信号，共 {len(stock_pool)} 只股票")
-    total_signals = 0
-    for i, code in enumerate(stock_pool, 1):
-        try:
-            df = get_daily_kline_df(code)
-            if df.empty or len(df) < 35:
-                continue
-            records = generate_daily_signals_for_stock(df, code)
-            if records:
-                save_signals(records)
-                total_signals += len(records)
-        except Exception as e:
-            logger.error(f"{code} 信号计算失败: {e}")
-
-        if i % 100 == 0:
-            logger.info(f"信号计算进度: {i}/{len(stock_pool)} ({i*100//len(stock_pool)}%)  已生成 {total_signals} 条信号")
-
-    logger.info(f"日线信号计算完成，共生成 {total_signals} 条信号")
-    return total_signals
-
-
-def daily_update_market_all():
-    """全市场每日更新：仅更新日线数据"""
-    from data_fetcher.stock_pool import get_stock_pool_from_db
-
-    logger.info("========== 开始全市场每日更新 ==========")
-    start = datetime.now()
-
-    kline_count = 0
-    try:
-        stock_pool = get_stock_pool_from_db()
-        if not stock_pool:
-            logger.error("股票池为空，请先运行 update-stock-list 更新股票列表")
-            return
-
-        logger.info(f"全市场股票池: {len(stock_pool)} 只")
-
-        kline_count = update_all_daily_klines(stock_pool=stock_pool) or 0
-    except KeyboardInterrupt:
-        logger.info("收到中断信号，停止更新")
-    except Exception as e:
-        logger.error(f"全市场更新异常: {e}", exc_info=True)
-
-    elapsed = (datetime.now() - start).total_seconds()
-    logger.info(f"========== 全市场更新完成，新增K线 {kline_count} 条，耗时 {elapsed:.1f}s ==========")
+    logger.info(f'========== 每日更新完成，耗时 {elapsed:.1f}s ==========')

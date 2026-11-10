@@ -353,6 +353,24 @@ def update_single_stock(code: str, end_date: str = None) -> int:
             df = fetch_daily_kline(code, start_date, end_date)
             if df.empty:
                 return 0
+
+            # 检测除权除息：如果新数据第一天的价格变化与pct_chg不符，说明旧数据复权因子过期
+            if last_date and len(df) > 0:
+                old_df = get_daily_kline_df(code, start_date=last_date, end_date=last_date)
+                if not old_df.empty:
+                    old_close = float(old_df['close'].iloc[0])
+                    new_close = float(df['close'].iloc[0])
+                    new_pct = float(df['pctChg'].iloc[0]) if pd.notna(df['pctChg'].iloc[0]) else 0.0
+                    if old_close > 0:
+                        price_change = (new_close - old_close) / old_close * 100
+                        if abs(price_change - new_pct) > 1.0:
+                            logger.info(f"{code} 检测到除权除息(价格变化{price_change:.2f}% vs pct_chg{new_pct:.2f}%)，重新拉取全量数据")
+                            full_start = (datetime.now() - timedelta(days=365 * 3)).strftime('%Y-%m-%d')
+                            full_df = fetch_daily_kline(code, full_start, end_date)
+                            if not full_df.empty:
+                                save_daily_klines(code, full_df)
+                                return len(full_df)
+
             save_daily_klines(code, df)
             return len(df)
         except Exception as e:
@@ -680,6 +698,24 @@ def get_daily_kline_df(
         return pd.DataFrame(data)
 
 
+def get_trade_dates(start_date: str, end_date: str) -> List[str]:
+    """获取指定日期范围内的所有交易日列表
+
+    Args:
+        start_date: 起始日期 YYYY-MM-DD
+        end_date: 结束日期 YYYY-MM-DD
+
+    Returns:
+        交易日列表，如 ['2026-07-20', '2026-07-21', ...]
+    """
+    with session_scope() as session:
+        query = session.query(DailyKline.trade_date).filter(
+            DailyKline.trade_date >= start_date,
+            DailyKline.trade_date <= end_date,
+        ).distinct().order_by(DailyKline.trade_date.asc()).limit(500)
+        return [r[0].strftime('%Y-%m-%d') for r in query.all()]
+
+
 def get_daily_kline_batch(
     code_list: List[str],
     start_date: str = None,
@@ -751,3 +787,133 @@ def get_daily_kline_batch(
                 result[c] = sub.sort_values('date').reset_index(drop=True)
 
     return result
+
+
+def detect_price_discontinuity(code: str, tolerance: float = 1.0) -> List[dict]:
+    """检测股票数据中是否存在除权除息导致的价格断层
+
+    判断逻辑：如果 (close[t] - close[t-1]) / close[t-1] * 100 与 pct_chg[t] 差异超过 tolerance%，
+    说明存在复权因子不一致。
+
+    Args:
+        code: 股票代码（如 sz.301503）
+        tolerance: 容差百分比，默认1%
+
+    Returns:
+        断层记录列表，每条包含 date, close_prev, close_curr, pct_chg, price_change, diff
+    """
+    df = get_daily_kline_df(code)
+    if df.empty or len(df) < 2:
+        return []
+
+    issues = []
+    for i in range(1, len(df)):
+        close_prev = float(df['close'].iloc[i - 1])
+        close_curr = float(df['close'].iloc[i])
+        pct_chg = float(df['pct_chg'].iloc[i]) if pd.notna(df['pct_chg'].iloc[i]) else 0.0
+
+        if close_prev <= 0:
+            continue
+
+        price_change = (close_curr - close_prev) / close_prev * 100
+        diff = abs(price_change - pct_chg)
+
+        if diff > tolerance:
+            issues.append({
+                'date': str(df['date'].iloc[i]),
+                'close_prev': close_prev,
+                'close_curr': close_curr,
+                'pct_chg': pct_chg,
+                'price_change': price_change,
+                'diff': diff,
+            })
+
+    return issues
+
+
+def repair_stock_data(code: str, fetch_years: int = 3) -> int:
+    """重新拉取股票全量历史数据，修复除权除息导致的数据不一致
+
+    Args:
+        code: 股票代码（如 sz.301503）
+        fetch_years: 拉取多少年的历史数据，默认3年
+
+    Returns:
+        更新的K线条数
+    """
+    code = normalize_code(code)
+    start_date = (datetime.now() - timedelta(days=365 * fetch_years)).strftime('%Y-%m-%d')
+    end_date = datetime.now().strftime('%Y-%m-%d')
+
+    for attempt in range(3):
+        try:
+            df = fetch_daily_kline(code, start_date, end_date)
+            if df.empty:
+                return 0
+            save_daily_klines(code, df)
+            return len(df)
+        except Exception as e:
+            err_msg = str(e)
+            if "10054" in err_msg or "连接被重置" in err_msg:
+                try:
+                    bs_logout()
+                except Exception:
+                    pass
+                time.sleep(2 + attempt * 2)
+                if not bs_login():
+                    time.sleep(5)
+                continue
+            logger.warning(f"{code} 修复失败(第{attempt+1}次): {e}")
+            time.sleep(1 + attempt * 2)
+
+    logger.error(f"{code} 修复失败，已重试3次")
+    return 0
+
+
+def detect_and_repair_all(stock_pool: List[str] = None, tolerance: float = 1.0) -> dict:
+    """扫描全市场，检测并修复除权除息导致的数据不一致
+
+    Args:
+        stock_pool: 股票代码列表，默认使用全市场
+        tolerance: 价格断层容差百分比，默认1%
+
+    Returns:
+        统计信息 dict
+    """
+    if stock_pool is None:
+        # 优先从数据库已有的K线数据中获取股票列表
+        from sqlalchemy import text
+        with session_scope() as session:
+            result = session.execute(text("SELECT DISTINCT code FROM daily_kline WHERE adjustflag = 2"))
+            stock_pool = [r[0] for r in result]
+        if not stock_pool:
+            stock_pool = fetch_stock_list()
+            stock_pool = [s['code'] for s in stock_pool]
+
+    total = len(stock_pool)
+    repaired = 0
+    issues_found = []
+
+    for i, code in enumerate(stock_pool):
+        if (i + 1) % 500 == 0:
+            logger.info(f"扫描进度: {i+1}/{total}, 已修复: {repaired}")
+
+        try:
+            issues = detect_price_discontinuity(code, tolerance)
+            if issues:
+                issues_found.append({'code': code, 'issues': issues})
+                logger.info(f"{code} 检测到 {len(issues)} 处价格断层，重新拉取全量数据...")
+                count = repair_stock_data(code)
+                if count > 0:
+                    repaired += 1
+                    logger.info(f"{code} 修复完成，更新 {count} 条数据")
+        except Exception as e:
+            logger.warning(f"{code} 检测失败: {e}")
+
+    logger.info(f"扫描完成: 共 {total} 只股票, 检测到断层 {len(issues_found)} 只, 修复 {repaired} 只")
+    return {
+        'total': total,
+        'issues_found': len(issues_found),
+        'repaired': repaired,
+        'details': issues_found,
+    }
